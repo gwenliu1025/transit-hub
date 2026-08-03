@@ -4,17 +4,20 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"transithub/backend/internal/modules/upstream"
 )
 
 // fakeMySiteSync 记录 SyncAdminSession 的调用参数，供测试断言刷新成功后是否同步到 my_site_states。
 type fakeMySiteSync struct {
-	called         bool
-	userID         string
-	adminAccountID string
-	session        upstream.Session
-	identity       string
+	called          bool
+	userID          string
+	adminAccountID  string
+	session         upstream.Session
+	storedSession   *upstream.Session
+	requiredSession *upstream.Session
+	identity        string
 }
 
 func (f *fakeMySiteSync) SyncAdminSession(ctx context.Context, userID string, adminAccountID string, session upstream.Session, identity string) error {
@@ -27,11 +30,26 @@ func (f *fakeMySiteSync) SyncAdminSession(ctx context.Context, userID string, ad
 }
 
 func (f *fakeMySiteSync) RequireSession(ctx context.Context, userID string, adminAccountID string) (upstream.Session, error) {
+	if f.requiredSession != nil {
+		return *f.requiredSession, nil
+	}
 	return f.session, nil
 }
 
 func (f *fakeMySiteSync) StoredSession(ctx context.Context, userID string, adminAccountID string) (upstream.Session, bool, error) {
+	if f.storedSession != nil {
+		return *f.storedSession, true, nil
+	}
 	return f.session, f.session.IsAuthenticated(), nil
+}
+
+type activeSessionStore struct {
+	*fakeSessionStore
+	refs []ActiveSessionRef
+}
+
+func (s *activeSessionStore) ActiveSessions(ctx context.Context) ([]ActiveSessionRef, error) {
+	return s.refs, nil
 }
 
 func newRefreshTestService(store *fakeSessionStore, platform *fakePlatformClient, mySync *fakeMySiteSync) *Service {
@@ -157,6 +175,73 @@ func TestStatusReconcilesRedisWithAuthoritativeSession(t *testing.T) {
 	saved, _ := store.Get(context.Background(), "user-1", "account-1")
 	if saved == nil || saved.Session.AccessToken != "new-token" || saved.Session.RefreshToken != "new-refresh" {
 		t.Fatalf("expected Redis session to reconcile to authoritative session, got %+v", saved)
+	}
+}
+
+func TestStatusSyncsVerifiedSessionToMySiteState(t *testing.T) {
+	store := newFakeSessionStore()
+	record := AdminSession{
+		Platform: PlatformSub2API,
+		Identity: "admin@example.com",
+		Session:  authenticatedSession(),
+	}
+	store.set("user-1", "account-1", record)
+	mySync := &fakeMySiteSync{session: record.Session}
+	service := newRefreshTestService(store, &fakePlatformClient{}, mySync)
+
+	status, err := service.Status(context.Background(), "user-1")
+	if err != nil {
+		t.Fatalf("Status returned error: %v", err)
+	}
+	if !status.Authenticated {
+		t.Fatal("expected authenticated status")
+	}
+	if !mySync.called {
+		t.Fatal("expected verified session to be synchronized")
+	}
+	if mySync.session.AccessToken != record.Session.AccessToken {
+		t.Fatalf("expected synchronized session %q, got %q", record.Session.AccessToken, mySync.session.AccessToken)
+	}
+}
+
+func TestRefreshDueSessionsSyncsRefreshedSessionAfterSave(t *testing.T) {
+	store := &activeSessionStore{
+		fakeSessionStore: newFakeSessionStore(),
+		refs:             []ActiveSessionRef{{UserID: "user-1", AdminAccountID: "account-1"}},
+	}
+	oldExpiry := time.Now().Add(-time.Minute).UnixMilli()
+	newExpiry := time.Now().Add(time.Hour).UnixMilli()
+	oldSession := upstream.Session{
+		Platform: upstream.PlatformSub2API, BaseURL: "https://example.com",
+		AccessToken: "old-token", RefreshToken: "old-refresh", ExpiresAt: &oldExpiry,
+	}
+	newSession := upstream.Session{
+		Platform: upstream.PlatformSub2API, BaseURL: "https://example.com",
+		AccessToken: "new-token", RefreshToken: "new-refresh", ExpiresAt: &newExpiry,
+	}
+	store.set("user-1", "account-1", AdminSession{
+		Platform: PlatformSub2API,
+		Identity: "admin@example.com",
+		Session:  oldSession,
+	})
+	mySync := &fakeMySiteSync{storedSession: &oldSession, requiredSession: &newSession}
+	service := NewService(store, &fakePlatformClient{})
+	service.SetMySiteSync(mySync)
+
+	service.refreshDueSessions(context.Background())
+
+	saved, err := store.Get(context.Background(), "user-1", "account-1")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if saved == nil || saved.Session.AccessToken != "new-token" {
+		t.Fatalf("expected refreshed session to be saved, got %+v", saved)
+	}
+	if !mySync.called {
+		t.Fatal("expected saved refreshed session to be synchronized")
+	}
+	if mySync.session.AccessToken != "new-token" {
+		t.Fatalf("expected synchronized refreshed token, got %q", mySync.session.AccessToken)
 	}
 }
 

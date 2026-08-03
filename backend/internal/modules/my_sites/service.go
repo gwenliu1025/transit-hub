@@ -938,7 +938,11 @@ func (s *Service) validatedState(ctx context.Context, state *State) (*State, err
 	}
 	refreshedSession, err := s.platformService.RefreshSession(state.Session)
 	if err != nil {
-		return nil, requestError(ErrorAdminOnly)
+		// 刷新令牌失败不代表现有访问令牌已失效，仍用原会话完成管理员校验。
+		if verifyErr := s.platformService.VerifyAdmin(state.Session); verifyErr != nil {
+			return nil, requestError(ErrorAdminOnly)
+		}
+		return state, nil
 	}
 	if refreshedSession.AccessToken != state.Session.AccessToken || refreshedSession.RefreshToken != state.Session.RefreshToken ||
 		refreshedSession.Cookie != state.Session.Cookie {

@@ -116,6 +116,11 @@ func (s *Service) Status(ctx context.Context, userID string) (StatusResponse, er
 	if err := s.platform.VerifyAdmin(record.Session); err != nil {
 		return statusFromRecord(*record, false), nil
 	}
+	if s.mySiteSync != nil {
+		if err := s.mySiteSync.SyncAdminSession(ctx, userID, adminAccountID, record.Session, record.Identity); err != nil {
+			return StatusResponse{}, err
+		}
+	}
 	return statusFromRecord(*record, true), nil
 }
 
@@ -361,6 +366,12 @@ func (s *Service) refreshDueSessions(ctx context.Context) {
 		if err := s.store.Save(ctx, ref.UserID, ref.AdminAccountID, *refreshed); err != nil {
 			log.Printf("dashboard admin refresh save failed user_id=%s admin_account_id=%s err=%v", ref.UserID, ref.AdminAccountID, err)
 			continue
+		}
+		if s.mySiteSync != nil {
+			if err := s.mySiteSync.SyncAdminSession(ctx, ref.UserID, ref.AdminAccountID, refreshed.Session, refreshed.Identity); err != nil {
+				log.Printf("dashboard admin refresh sync failed user_id=%s admin_account_id=%s err=%v", ref.UserID, ref.AdminAccountID, err)
+				continue
+			}
 		}
 		log.Printf("dashboard admin token refreshed user_id=%s admin_account_id=%s base_url=%s", ref.UserID, ref.AdminAccountID, refreshed.BaseURL)
 	}

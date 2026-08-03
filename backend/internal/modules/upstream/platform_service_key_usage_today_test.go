@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 )
 
 // TestFetchKeyUsageToday_Sub2API_PaginatesKeysAndFiltersZeroCost 覆盖测试要求 5：
@@ -73,6 +74,58 @@ func TestFetchKeyUsageToday_Sub2API_PaginatesKeysAndFiltersZeroCost(t *testing.T
 	}
 	if byID["150"] != 3.25 {
 		t.Errorf("key 150 (only reachable via page 2) cost = %.2f, want 3.25 — pagination may have stopped at page 1", byID["150"])
+	}
+}
+
+// TestFetchKeyUsageToday_Sub2API_UsesShanghaiDate 验证 Sub2API 的逐 key 今日统计
+// 不受进程本地时区影响，日期和 timezone 参数始终按北京时间生成。
+func TestFetchKeyUsageToday_Sub2API_UsesShanghaiDate(t *testing.T) {
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("加载北京时间时区失败: %v", err)
+	}
+	now := time.Now()
+	wantDate := now.In(shanghai).Format("2006-01-02")
+	testLocal := time.FixedZone("UTC-12", -12*60*60)
+	if now.In(testLocal).Format("2006-01-02") == wantDate {
+		testLocal = time.FixedZone("UTC+14", 14*60*60)
+	}
+	originalLocal := time.Local
+	time.Local = testLocal
+	t.Cleanup(func() { time.Local = originalLocal })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/keys":
+			writeJSON(w, map[string]any{
+				"data":  []map[string]any{{"id": 7, "name": "beijing-key", "group": map[string]any{"name": "vip"}}},
+				"total": 1,
+			})
+		case "/api/v1/usage/stats":
+			if got := r.URL.Query().Get("start_date"); got != wantDate {
+				t.Errorf("start_date = %q, want Beijing date %q", got, wantDate)
+			}
+			if got := r.URL.Query().Get("end_date"); got != wantDate {
+				t.Errorf("end_date = %q, want Beijing date %q", got, wantDate)
+			}
+			if got := r.URL.Query().Get("timezone"); got != "Asia/Shanghai" {
+				t.Errorf("timezone = %q, want Asia/Shanghai", got)
+			}
+			writeJSON(w, map[string]any{"data": map[string]any{"total_actual_cost": 2.5}})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	service := NewPlatformService(NewHTTPClient(server.Client()))
+	stats, err := service.FetchKeyUsageToday(Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stats) != 1 || stats[0].TodayAmount != 2.5 {
+		t.Fatalf("unexpected stats: %+v", stats)
 	}
 }
 

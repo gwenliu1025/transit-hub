@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // availableGroupsFixture 是各测试共用的 /api/v1/groups/available 响应：
@@ -193,12 +194,28 @@ func TestFetchSub2APIAdminGroups_RatesUnavailable(t *testing.T) {
 // TestFetchSub2APIMetrics_UsesOverriddenMultiplier 验证 fetchSub2APIMetrics 的
 // Metrics.Groups 复用同一套合并逻辑，使用覆盖后的最终生效倍率。
 func TestFetchSub2APIMetrics_UsesOverriddenMultiplier(t *testing.T) {
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("加载北京时间时区失败: %v", err)
+	}
+	today := time.Now().In(shanghai).Format("2006-01-02")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/auth/me":
 			writeJSON(w, map[string]any{"data": map[string]any{"balance": 10.0, "total_recharged": 20.0}})
 		case "/api/v1/usage/dashboard/stats":
-			writeJSON(w, map[string]any{"data": map[string]any{"today_actual_cost": 1.0}})
+			writeJSON(w, map[string]any{"data": map[string]any{"today_actual_cost": 99.0, "total_actual_cost": 30.0}})
+		case "/api/v1/usage/stats":
+			if got := r.URL.Query().Get("start_date"); got != today {
+				t.Errorf("start_date = %q, want %q", got, today)
+			}
+			if got := r.URL.Query().Get("end_date"); got != today {
+				t.Errorf("end_date = %q, want %q", got, today)
+			}
+			if got := r.URL.Query().Get("timezone"); got != "Asia/Shanghai" {
+				t.Errorf("timezone = %q, want Asia/Shanghai", got)
+			}
+			writeJSON(w, map[string]any{"data": map[string]any{"total_actual_cost": 1.25}})
 		case "/api/v1/groups/available":
 			availableGroupsFixture(w)
 		case "/api/v1/groups/rates":
@@ -215,6 +232,9 @@ func TestFetchSub2APIMetrics_UsesOverriddenMultiplier(t *testing.T) {
 	metrics, err := service.fetchSub2APIMetrics(session)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if metrics.TodayConsume.Value == nil || *metrics.TodayConsume.Value != 1.25 {
+		t.Fatalf("TodayConsume = %v, want 1.25 from /api/v1/usage/stats", metrics.TodayConsume.Value)
 	}
 	byName := map[string]GroupInfo{}
 	for _, g := range metrics.Groups {
