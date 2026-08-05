@@ -8,6 +8,8 @@ import (
 	"net/http"
 )
 
+const maxJSONResponseBytes int64 = 8 << 20
+
 // BrowserUserAgent 是所有上游 HTTP 请求统一使用的浏览器 User-Agent。
 const BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
@@ -116,9 +118,13 @@ func encodeBody(body any) (io.Reader, error) {
 }
 
 func parseJSON(reader io.Reader, reqURL string) (any, error) {
-	data, err := io.ReadAll(reader)
+	data, err := io.ReadAll(io.LimitReader(reader, maxJSONResponseBytes+1))
 	if err != nil {
 		log.Printf("[http-client] 读取响应体失败 url=%s err=%v", reqURL, err)
+		return nil, newRequestError(ErrorInvalidResponse, "")
+	}
+	if int64(len(data)) > maxJSONResponseBytes {
+		log.Printf("[http-client] 响应体超过上限 url=%s limit=%d", reqURL, maxJSONResponseBytes)
 		return nil, newRequestError(ErrorInvalidResponse, "")
 	}
 	if len(data) == 0 {
