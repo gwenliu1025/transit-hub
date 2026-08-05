@@ -103,6 +103,32 @@ func (r *Repository) GetFirstStrategy(ctx context.Context) (StrategySettings, er
 	return settings, nil
 }
 
+func (r *Repository) ListStrategies(ctx context.Context) ([]WorkspaceStrategy, error) {
+	rows, err := r.db.Query(ctx, `SELECT user_id, admin_account_id, settings FROM strategy_settings`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	strategies := make([]WorkspaceStrategy, 0)
+	for rows.Next() {
+		var strategy WorkspaceStrategy
+		var settingsJSON []byte
+		if err := rows.Scan(&strategy.UserID, &strategy.AdminAccountID, &settingsJSON); err != nil {
+			return nil, err
+		}
+		strategy.Settings = DefaultStrategySettings()
+		if err := json.Unmarshal(settingsJSON, &strategy.Settings); err != nil {
+			return nil, err
+		}
+		strategies = append(strategies, strategy)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return strategies, nil
+}
+
 func (r *Repository) GetStrategy(ctx context.Context, userID string, adminAccountID string) (StrategySettings, error) {
 	settings := DefaultStrategySettings()
 	row := r.db.QueryRow(ctx, `SELECT settings FROM strategy_settings WHERE user_id = $1 AND admin_account_id = $2`, userID, adminAccountID)

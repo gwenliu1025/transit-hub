@@ -49,7 +49,7 @@ type Service struct {
 	client            *http.Client
 	repository        *Repository
 	accounts          AdminAccountResolver
-	OnStrategyChanged func(StrategySettings)
+	OnStrategyChanged func(userID, adminAccountID string, settings StrategySettings)
 
 	// smtpRepo 是 SMTP 存储层的窄接口，由 *Repository 结构性满足；测试可注入内存 fake。
 	smtpRepo smtpRepository
@@ -130,11 +130,27 @@ func (s *Service) GetFirstStrategy(ctx context.Context) (StrategySettings, error
 	return s.repository.GetFirstStrategy(ctx)
 }
 
+// WorkspaceStrategy 保存带工作区标识的策略，用于启动时恢复各工作区调度配置。
+type WorkspaceStrategy struct {
+	UserID         string
+	AdminAccountID string
+	Settings       StrategySettings
+}
+
+func (s *Service) ListStrategies(ctx context.Context) ([]WorkspaceStrategy, error) {
+	return s.repository.ListStrategies(ctx)
+}
+
 func (s *Service) GetStrategy(ctx context.Context, userID string) (StrategySettings, error) {
 	adminAccountID, err := s.currentAdminAccountID(ctx, userID)
 	if err != nil {
 		return StrategySettings{}, err
 	}
+	return s.repository.GetStrategy(ctx, userID, adminAccountID)
+}
+
+// GetStrategyForAccount 按显式工作区读取策略，供后台跨工作区任务使用。
+func (s *Service) GetStrategyForAccount(ctx context.Context, userID, adminAccountID string) (StrategySettings, error) {
 	return s.repository.GetStrategy(ctx, userID, adminAccountID)
 }
 
@@ -147,10 +163,14 @@ func (s *Service) SaveStrategy(ctx context.Context, userID string, settings Stra
 	if err := s.repository.SaveStrategy(ctx, userID, adminAccountID, settings); err != nil {
 		return StrategySettings{}, err
 	}
-	if s.OnStrategyChanged != nil {
-		s.OnStrategyChanged(settings)
-	}
+	s.notifyStrategyChanged(userID, adminAccountID, settings)
 	return settings, nil
+}
+
+func (s *Service) notifyStrategyChanged(userID, adminAccountID string, strategy StrategySettings) {
+	if s.OnStrategyChanged != nil {
+		s.OnStrategyChanged(userID, adminAccountID, strategy)
+	}
 }
 
 func (s *Service) SaveNotificationChannels(ctx context.Context, userID string, settings NotificationChannelSettings) (NotificationChannelSettings, error) {

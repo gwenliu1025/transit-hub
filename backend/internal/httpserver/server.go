@@ -246,22 +246,26 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	connHealthService.StartScheduler(context.Background())
 
 	// 策略设置变更时通知上游服务更新定时同步配置。
-	applyRefreshConfig := func(s settings.StrategySettings) {
-		upstreamService.SetRefreshConfig(upstream.RefreshConfig{
+	applyRefreshConfig := func(userID, adminAccountID string, s settings.StrategySettings) {
+		upstreamService.SetWorkspaceRefreshConfig(userID, adminAccountID, upstream.RefreshConfig{
 			Enabled:  s.EnableRefreshInterval,
 			Interval: time.Duration(s.RefreshInterval) * time.Second,
 		})
 	}
 	settingsService.OnStrategyChanged = applyRefreshConfig
 
-	// 启动时读取已保存的策略设置，按配置决定是否开启定时同步。
-	if strategy, err := settingsService.GetFirstStrategy(context.Background()); err == nil {
-		applyRefreshConfig(strategy)
+	// 启动时读取所有工作区的策略设置，分别恢复对应的定时同步配置。
+	if strategies, err := settingsService.ListStrategies(context.Background()); err == nil {
+		for _, strategy := range strategies {
+			applyRefreshConfig(strategy.UserID, strategy.AdminAccountID, strategy.Settings)
+		}
+	} else {
+		log.Printf("[settings] 启动时加载工作区策略失败: %v", err)
 	}
 
 	// 站点同步成功后检查余额预警和倍率变更，按配置发送通知。
 	upstreamService.AfterSync = func(ctx context.Context, userID, adminAccountID, siteID, siteName string, oldMetrics, newMetrics upstream.Metrics) {
-		strategy, err := settingsService.GetFirstStrategy(ctx)
+		strategy, err := settingsService.GetStrategyForAccount(ctx, userID, adminAccountID)
 		if err != nil {
 			return
 		}

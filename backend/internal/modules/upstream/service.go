@@ -32,6 +32,11 @@ type RefreshConfig struct {
 	Interval time.Duration
 }
 
+type refreshWorkspace struct {
+	userID         string
+	adminAccountID string
+}
+
 // Service 管理上游站点的生命周期（创建、编辑、同步、删除）。
 // 站点运行时状态缓存在 Redis（通过 SiteCache），PostgreSQL 负责持久化。
 // 当系统设置开启了数据刷新频率时，定时器按配置的间隔自动同步各站点。
@@ -41,8 +46,10 @@ type Service struct {
 	repository      SiteRepository
 	cache           SiteCache
 	accounts        AdminAccountResolver
-	refreshConfig   RefreshConfig
+	refreshConfigs  map[refreshWorkspace]RefreshConfig
+	legacyConfig    *RefreshConfig
 	timers          map[string]*time.Timer
+	timerWorkspaces map[string]refreshWorkspace
 	deletedSites    map[string]struct{}
 	mu              sync.Mutex
 	// AfterSync 在站点同步成功后被调用，传入同步前后的指标数据。
@@ -69,45 +76,65 @@ func NewService(platformService *PlatformService, repository SiteRepository, sna
 		snapshotWriter:  snapshotWriter,
 		repository:      repository,
 		cache:           cache,
+		refreshConfigs:  make(map[refreshWorkspace]RefreshConfig),
 		timers:          make(map[string]*time.Timer),
+		timerWorkspaces: make(map[string]refreshWorkspace),
 		deletedSites:    make(map[string]struct{}),
 	}
 }
 
-// SetRefreshConfig 更新后台定时同步配置。
-// 开启时为所有有会话的站点启动定时器；关闭时清除所有定时器。
-// 由系统设置模块在启动和保存策略时调用。
+// SetRefreshConfig 保留单租户调用方式，更新所有站点的后台定时同步配置。
 func (s *Service) SetRefreshConfig(config RefreshConfig) {
+	sites := s.listSitesForRefresh()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prev := s.refreshConfig
-	s.refreshConfig = config
+	s.legacyConfig = &config
+	s.clearAllTimersLocked()
+	if config.Enabled {
+		log.Printf("[upstream] 后台定时同步已开启 interval=%s", config.Interval)
+		for i := range sites {
+			s.scheduleSyncLocked(sites[i].ID, &sites[i])
+		}
+	} else {
+		log.Printf("[upstream] 后台定时同步已关闭")
+	}
+}
 
+// SetWorkspaceRefreshConfig 更新指定用户工作区的后台定时同步配置。
+// 配置和定时器均按 userID/adminAccountID 隔离，不会影响其他工作区。
+func (s *Service) SetWorkspaceRefreshConfig(userID, adminAccountID string, config RefreshConfig) {
+	workspace := refreshWorkspace{userID: userID, adminAccountID: adminAccountID}
+	var sites []Site
+	if config.Enabled {
+		sites = s.listSitesForRefresh()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.refreshConfigs == nil {
+		s.refreshConfigs = make(map[refreshWorkspace]RefreshConfig)
+	}
+	s.refreshConfigs[workspace] = config
+	s.clearWorkspaceTimersLocked(workspace)
 	if !config.Enabled {
-		// 关闭：清除所有定时器。
-		for id := range s.timers {
-			s.clearTimerLocked(id)
-		}
-		if prev.Enabled {
-			log.Printf("[upstream] 后台定时同步已关闭")
-		}
 		return
 	}
+	for i := range sites {
+		if sites[i].UserID == userID && sites[i].AdminAccountID == adminAccountID {
+			s.scheduleSyncLocked(sites[i].ID, &sites[i])
+		}
+	}
+}
 
-	log.Printf("[upstream] 后台定时同步已开启 interval=%s", config.Interval)
-
-	// 开启或间隔变更：重新调度所有有会话的站点。
+func (s *Service) listSitesForRefresh() []Site {
 	if s.repository == nil {
-		return
+		return nil
 	}
 	sites, err := s.repository.ListSites(context.Background())
 	if err != nil {
 		log.Printf("[upstream] 无法读取站点列表来调度定时器: %v", err)
-		return
+		return nil
 	}
-	for i := range sites {
-		s.scheduleSyncLocked(sites[i].ID, &sites[i])
-	}
+	return sites
 }
 
 // RestoreSavedSites 从 PostgreSQL 恢复所有站点到 Redis 缓存。
@@ -915,9 +942,7 @@ func (s *Service) CleanupDeletedWorkspaceSites(ctx context.Context, userID strin
 func (s *Service) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id := range s.timers {
-		s.clearTimerLocked(id)
-	}
+	s.clearAllTimersLocked()
 }
 
 // scheduleSyncLocked 根据刷新配置为站点调度下一次定时同步。
@@ -928,15 +953,31 @@ func (s *Service) scheduleSyncLocked(id string, site *Site) {
 	if _, deleted := s.deletedSites[id]; deleted {
 		return
 	}
-	if !s.refreshConfig.Enabled || site == nil || site.Session == nil {
+	if site == nil || site.Session == nil {
 		return
 	}
-	delay := s.refreshConfig.Interval
+	workspace := refreshWorkspace{userID: site.UserID, adminAccountID: site.AdminAccountID}
+	config, ok := s.refreshConfigs[workspace]
+	if !ok && s.legacyConfig != nil {
+		config = *s.legacyConfig
+		ok = true
+	}
+	if !ok || !config.Enabled {
+		return
+	}
+	delay := config.Interval
 	log.Printf("[upstream-timer] 定时同步已调度 id=%s delay=%s", id, delay)
+	if s.timers == nil {
+		s.timers = make(map[string]*time.Timer)
+	}
+	if s.timerWorkspaces == nil {
+		s.timerWorkspaces = make(map[string]refreshWorkspace)
+	}
 	s.timers[id] = time.AfterFunc(delay, func() {
 		log.Printf("[upstream-timer] 定时同步触发 id=%s", id)
 		s.sync(context.Background(), id)
 	})
+	s.timerWorkspaces[id] = workspace
 }
 
 func (s *Service) clearTimerLocked(id string) {
@@ -944,6 +985,21 @@ func (s *Service) clearTimerLocked(id string) {
 		timer.Stop()
 	}
 	delete(s.timers, id)
+	delete(s.timerWorkspaces, id)
+}
+
+func (s *Service) clearAllTimersLocked() {
+	for id := range s.timers {
+		s.clearTimerLocked(id)
+	}
+}
+
+func (s *Service) clearWorkspaceTimersLocked(workspace refreshWorkspace) {
+	for id, timerWorkspace := range s.timerWorkspaces {
+		if timerWorkspace == workspace {
+			s.clearTimerLocked(id)
+		}
+	}
 }
 
 func validateCreate(dto CreateRequest) error {
