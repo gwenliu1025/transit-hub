@@ -18,7 +18,10 @@ type sub2APIError struct {
 
 func (e *sub2APIError) Error() string { return e.detail }
 
-type Sub2APIViewerClient struct{ client *http.Client }
+type Sub2APIViewerClient struct {
+	client              *http.Client
+	allowPrivateTargets bool
+}
 
 func NewSub2APIViewerClient(client *http.Client) *Sub2APIViewerClient {
 	return NewSub2APIViewerClientWithPrivateTargets(client, false)
@@ -34,11 +37,15 @@ func NewSub2APIViewerClientWithPrivateTargets(client *http.Client, allowPrivateT
 		clone.Transport = newViewerTransport(net.DefaultResolver, allowPrivateTargets)
 		client = &clone
 	}
-	return &Sub2APIViewerClient{client: client}
+	return &Sub2APIViewerClient{client: client, allowPrivateTargets: allowPrivateTargets}
 }
 
 func (c *Sub2APIViewerClient) FetchCurrentUser(srcHost string, token string) (Sub2APIUser, error) {
-	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(srcHost, "/")+"/api/v1/auth/me", nil)
+	normalizedHost, err := normalizeSrcHostWithPrivateTargets(srcHost, c.allowPrivateTargets)
+	if err != nil {
+		return Sub2APIUser{}, &sub2APIError{detail: "invalid sub2api source host"}
+	}
+	req, err := http.NewRequest(http.MethodGet, normalizedHost+"/api/v1/auth/me", nil)
 	if err != nil {
 		return Sub2APIUser{}, &sub2APIError{detail: "build sub2api request failed"}
 	}

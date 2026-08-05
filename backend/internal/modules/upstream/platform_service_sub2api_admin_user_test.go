@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// TestFetchSub2APIAdminUser_RequestPathAndAuthHeader 验证请求路径拼接和 Authorization header，
-// 并覆盖 snake_case 字段解析（id/email/username/role/status/balance/frozen_balance/concurrency/
-// rpm_limit/created_at）。
+// TestFetchSub2APIAdminUser_RequestPathAndAuthHeader 楠岃瘉璇锋眰璺緞鎷兼帴鍜?Authorization header锛?
+// 骞惰鐩?snake_case 瀛楁瑙ｆ瀽锛坕d/email/username/role/status/balance/frozen_balance/concurrency/
+// rpm_limit/created_at锛夈€?
 func TestFetchSub2APIAdminUser_RequestPathAndAuthHeader(t *testing.T) {
 	var gotPath, gotAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -27,7 +27,7 @@ func TestFetchSub2APIAdminUser_RequestPathAndAuthHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 
 	user, err := service.FetchSub2APIAdminUser(session, "42")
@@ -85,7 +85,7 @@ func TestFetchSub2APIAdminUsersPage_RequestQueryAuthAndParsing(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 	page, err := service.FetchSub2APIAdminUsersPage(session, Sub2APIAdminUsersQuery{
 		Page: -2, PageSize: 500, Status: "active", Role: "admin", Search: " alice+notes & keys ", SortBy: "not_allowed", SortOrder: "sideways", Timezone: "Asia/Shanghai",
@@ -150,7 +150,7 @@ func TestFetchSub2APIAdminUserBreakdown_RequestQueryAuthAndParsing(t *testing.T)
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 	breakdown, err := service.FetchSub2APIAdminUserBreakdown(session, Sub2APIUserBreakdownQuery{StartDate: "2026-07-12", EndDate: "2026-07-13", SortBy: "email", Limit: 500, Timezone: "Asia/Shanghai"})
 	if err != nil {
@@ -186,7 +186,7 @@ func TestFetchSub2APIAdminUserBreakdown_Unsupported404Status(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	_, err := service.FetchSub2APIAdminUserBreakdown(Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token"}, Sub2APIUserBreakdownQuery{StartDate: "2026-07-12", EndDate: "2026-07-13"})
 	requestErr, ok := err.(*RequestError)
 	if !ok || requestErr.StatusCode != http.StatusNotFound {
@@ -204,7 +204,7 @@ func TestFetchSub2APIAdminUsersPage_UsesNormalizedPaginationFallback(t *testing.
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 	page, err := service.FetchSub2APIAdminUsersPage(session, Sub2APIAdminUsersQuery{Page: -2, PageSize: 500})
 	if err != nil {
@@ -223,7 +223,7 @@ func TestFetchSub2APIAdminUsersPage_OmitsEmptySearch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 	_, err := service.FetchSub2APIAdminUsersPage(session, Sub2APIAdminUsersQuery{Page: 1, PageSize: 20, Search: " \t\n "})
 	if err != nil {
@@ -240,7 +240,7 @@ func TestFetchSub2APIAdminUsersPage_MarksMissingPaginationUnknown(t *testing.T) 
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 	page, err := service.FetchSub2APIAdminUsersPage(session, Sub2APIAdminUsersQuery{Page: 1, PageSize: 100})
 	if err != nil {
@@ -262,7 +262,7 @@ func TestFetchSub2APIAdminUsersPage_AllowsKnownSortAndAscendingOrder(t *testing.
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 	_, err := service.FetchSub2APIAdminUsersPage(session, Sub2APIAdminUsersQuery{Page: 3, PageSize: 20, SortBy: "email", SortOrder: "asc"})
 	if err != nil {
@@ -281,7 +281,7 @@ func assertQueryValue(t *testing.T, values url.Values, key string, want string) 
 	}
 }
 
-// TestFetchSub2APIAdminUser_CamelCaseFieldsAndTimestamp 验证 camelCase 字段名和 unix 秒时间戳解析。
+// TestFetchSub2APIAdminUser_CamelCaseFieldsAndTimestamp 楠岃瘉 camelCase 瀛楁鍚嶅拰 unix 绉掓椂闂存埑瑙ｆ瀽銆?
 func TestFetchSub2APIAdminUser_CamelCaseFieldsAndTimestamp(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
@@ -290,7 +290,7 @@ func TestFetchSub2APIAdminUser_CamelCaseFieldsAndTimestamp(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 
 	user, err := service.FetchSub2APIAdminUser(session, "7")
@@ -311,7 +311,7 @@ func TestFetchSub2APIAdminUser_CamelCaseFieldsAndTimestamp(t *testing.T) {
 	}
 }
 
-// TestFetchSub2APIAdminUser_RejectsNonSub2APISession 验证非 sub2api session 直接拒绝，不发请求。
+// TestFetchSub2APIAdminUser_RejectsNonSub2APISession 楠岃瘉闈?sub2api session 鐩存帴鎷掔粷锛屼笉鍙戣姹傘€?
 func TestFetchSub2APIAdminUser_RejectsNonSub2APISession(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -320,7 +320,7 @@ func TestFetchSub2APIAdminUser_RejectsNonSub2APISession(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformNewAPI, BaseURL: server.URL, AccessToken: "token"}
 
 	if _, err := service.FetchSub2APIAdminUser(session, "42"); err == nil {
@@ -331,14 +331,14 @@ func TestFetchSub2APIAdminUser_RejectsNonSub2APISession(t *testing.T) {
 	}
 }
 
-// TestFetchSub2APIAdminUser_PropagatesNotFound 验证远端 404 时错误透传，不返回伪造数据。
+// TestFetchSub2APIAdminUser_PropagatesNotFound 楠岃瘉杩滅 404 鏃堕敊璇€忎紶锛屼笉杩斿洖浼€犳暟鎹€?
 func TestFetchSub2APIAdminUser_PropagatesNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token"}
 
 	if _, err := service.FetchSub2APIAdminUser(session, "42"); err == nil {
@@ -346,8 +346,8 @@ func TestFetchSub2APIAdminUser_PropagatesNotFound(t *testing.T) {
 	}
 }
 
-// TestFetchSub2APIAdminUserBalanceHistory_RequestPathAndPagination 验证分页 query 参数拼接、
-// type 参数透传，以及 items/total/total_recharged 解析。
+// TestFetchSub2APIAdminUserBalanceHistory_RequestPathAndPagination 楠岃瘉鍒嗛〉 query 鍙傛暟鎷兼帴銆?
+// type 鍙傛暟閫忎紶锛屼互鍙?items/total/total_recharged 瑙ｆ瀽銆?
 func TestFetchSub2APIAdminUserBalanceHistory_RequestPathAndPagination(t *testing.T) {
 	var gotPath, gotQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -365,7 +365,7 @@ func TestFetchSub2APIAdminUserBalanceHistory_RequestPathAndPagination(t *testing
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token", TokenType: "Bearer"}
 
 	history, err := service.FetchSub2APIAdminUserBalanceHistory(session, "42", 1, 20, "balance")
@@ -398,8 +398,8 @@ func TestFetchSub2APIAdminUserBalanceHistory_RequestPathAndPagination(t *testing
 	}
 }
 
-// TestFetchSub2APIAdminUserBalanceHistory_InvalidPagingFallsBackToDefaults 验证越界分页参数
-// 回退到 page=1/pageSize=20。
+// TestFetchSub2APIAdminUserBalanceHistory_InvalidPagingFallsBackToDefaults 楠岃瘉瓒婄晫鍒嗛〉鍙傛暟
+// 鍥為€€鍒?page=1/pageSize=20銆?
 func TestFetchSub2APIAdminUserBalanceHistory_InvalidPagingFallsBackToDefaults(t *testing.T) {
 	var gotQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -408,7 +408,7 @@ func TestFetchSub2APIAdminUserBalanceHistory_InvalidPagingFallsBackToDefaults(t 
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token"}
 
 	if _, err := service.FetchSub2APIAdminUserBalanceHistory(session, "42", 0, -5, ""); err != nil {
@@ -419,7 +419,7 @@ func TestFetchSub2APIAdminUserBalanceHistory_InvalidPagingFallsBackToDefaults(t 
 	}
 }
 
-// TestFetchSub2APIAdminUserBalanceHistory_RejectsEmptyUserID 验证空用户 ID 直接拒绝，不发请求。
+// TestFetchSub2APIAdminUserBalanceHistory_RejectsEmptyUserID 楠岃瘉绌虹敤鎴?ID 鐩存帴鎷掔粷锛屼笉鍙戣姹傘€?
 func TestFetchSub2APIAdminUserBalanceHistory_RejectsEmptyUserID(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -427,7 +427,7 @@ func TestFetchSub2APIAdminUserBalanceHistory_RejectsEmptyUserID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "admin-token"}
 
 	if _, err := service.FetchSub2APIAdminUserBalanceHistory(session, "  ", 1, 20, ""); err == nil {

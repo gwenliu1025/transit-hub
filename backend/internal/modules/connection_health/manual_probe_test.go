@@ -180,7 +180,7 @@ func TestManualProbeTarget_NeverRunsRemoteAction(t *testing.T) {
 	}
 	svc := &Service{
 		repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"},
-		dispatcher: panicIfCalledRemoteActionRunner{}, probeRunner: NewRealProbeRunner(), platformGroups: reader,
+		dispatcher: panicIfCalledRemoteActionRunner{}, probeRunner: newTestRealProbeRunner(), platformGroups: reader,
 	}
 
 	results, err := svc.ManualProbeTarget(context.Background(), "user1", "sub2api:ws1:acc-1", []string{"gpt-4o"})

@@ -24,7 +24,7 @@ func normalizeSrcHostWithPrivateTargets(value string, allowPrivateTargets bool) 
 		trimmed = "https://" + trimmed
 	}
 	parsed, err := url.Parse(trimmed)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || !isAllowedSrcHost(parsed.Hostname(), allowPrivateTargets) {
+	if err != nil || (parsed.Scheme != "https" && !(allowPrivateTargets && parsed.Scheme == "http")) || !isAllowedSrcHost(parsed.Hostname(), allowPrivateTargets) {
 		return "", requestError(ErrorEmbedInvalidSrcHost)
 	}
 	parsed.Path = ""

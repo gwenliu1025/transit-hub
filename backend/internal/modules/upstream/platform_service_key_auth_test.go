@@ -23,7 +23,7 @@ func TestLoginAdminWithKeySub2APIUsesXAPIKey(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session, err := service.LoginAdminWithKey(server.URL, PlatformSub2API, "admin-key", "")
 	if err != nil {
 		t.Fatalf("LoginAdminWithKey returned error: %v", err)
@@ -63,7 +63,7 @@ func TestLoginWithUserKeyNewAPIUsesBearerAndUserID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	result, err := service.LoginWithUserKey(server.URL, "42", "system-token")
 	if err != nil {
 		t.Fatalf("LoginWithUserKey returned error: %v", err)
@@ -90,7 +90,7 @@ func TestLoginAdminWithKeyNewAPIRejectsNonAdminRole(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	_, err := service.LoginAdminWithKey(server.URL, PlatformNewAPI, "root-token", "7")
 	if err == nil || !strings.Contains(err.Error(), ErrorAuth) {
 		t.Fatalf("expected admin role rejection, got %v", err)
@@ -108,7 +108,7 @@ func TestLoginWithUserKeyRejectsSuccessFalseEnvelope(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	if _, err := service.LoginWithUserKey(server.URL, "42", "invalid-token"); err == nil {
 		t.Fatal("expected success=false response to reject the user key")
 	}
@@ -127,7 +127,7 @@ func TestFetchSub2APIAdminUsageStatsUsesAdminAPIKey(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	value, err := service.FetchSub2APIAdminUsageStats(Session{
 		Platform: PlatformSub2API, BaseURL: server.URL, AdminAPIKey: "admin-key",
 	}, "2026-07-14", "2026-07-14")

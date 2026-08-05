@@ -26,11 +26,21 @@ func jsonMarshal(v any) ([]byte, error) {
 const refreshSkewMS int64 = 60_000
 
 type PlatformService struct {
-	httpClient *HTTPClient
+	httpClient  *HTTPClient
+	validateURL func(string) bool
 }
 
 func NewPlatformService(httpClient *HTTPClient) *PlatformService {
-	return &PlatformService{httpClient: httpClient}
+	return &PlatformService{httpClient: httpClient, validateURL: isPublicHTTPSURL}
+}
+
+// newPlatformServiceWithURLValidator 仅供包内测试显式注入 URL 校验器；生产路径必须使用
+// NewPlatformService 的公网 HTTPS 默认策略。
+func newPlatformServiceWithURLValidator(httpClient *HTTPClient, validateURL func(string) bool) *PlatformService {
+	if validateURL == nil {
+		validateURL = isPublicHTTPSURL
+	}
+	return &PlatformService{httpClient: httpClient, validateURL: validateURL}
 }
 
 // newAPIAuthOptions supports both legacy cookie sessions and system access tokens.
@@ -66,8 +76,8 @@ func (s *PlatformService) NormalizeURL(value string) (string, error) {
 		trimmed = "https://" + trimmed
 	}
 	parsed, err := url.Parse(trimmed)
-	// 仅允许 http/https，且主机名必须是合法 IP 或域名，拦截明显写错的站点地址。
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || !isValidHost(parsed.Hostname()) {
+	// 生产校验器进一步收紧为公网 HTTPS；测试 seam 仍只可放宽到 HTTP/HTTPS。
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || !isValidHost(parsed.Hostname()) || s.validateURL == nil || !s.validateURL(trimmed) {
 		return "", newRequestError(ErrorInvalidURL, "")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
@@ -837,7 +847,7 @@ func (s *PlatformService) fetchSub2APIKeyGroupDailyStats(session Session) ([]Gro
 	if len(keys) == 0 {
 		return nil, newRequestError(ErrorInvalidResponse, PlatformSub2API)
 	}
-	today := time.Now().Format("2006-01-02")
+	today := sub2APIShanghaiToday()
 	totals := map[string]float64{}
 	for _, item := range keys {
 		keyID := firstNumber(item, []string{"id"})
@@ -984,7 +994,7 @@ func (s *PlatformService) fetchSub2APIKeyUsageToday(session Session) ([]KeyUsage
 		return nil, nil
 	}
 
-	today := time.Now().Format("2006-01-02")
+	today := sub2APIShanghaiToday()
 	const maxKeyConcurrency = 4
 	sem := make(chan struct{}, maxKeyConcurrency)
 	var wg sync.WaitGroup
@@ -1279,6 +1289,12 @@ func (s *PlatformService) fetchSub2APIMetrics(session Session) (Metrics, error) 
 		log.Printf("[sub2api-metrics] /api/v1/usage/dashboard/stats 失败 base_url=%s err=%v", session.BaseURL, err)
 		return Metrics{}, err
 	}
+	today := sub2APIShanghaiToday()
+	todayStats, err := s.httpClient.requestJSON(session.BaseURL+"/api/v1/usage/stats?start_date="+today+"&end_date="+today+"&timezone=Asia%2FShanghai", authOptions)
+	if err != nil {
+		log.Printf("[sub2api-metrics] /api/v1/usage/stats 失败 base_url=%s err=%v", session.BaseURL, err)
+		return Metrics{}, err
+	}
 	groups, err := s.fetchSub2APIAvailableGroupsWithRates(session)
 	if err != nil {
 		log.Printf("[sub2api-metrics] 分组列表拉取失败 base_url=%s err=%v", session.BaseURL, err)
@@ -1287,6 +1303,7 @@ func (s *PlatformService) fetchSub2APIMetrics(session Session) (Metrics, error) 
 
 	meData := dataRecord(me.Payload)
 	statsData := dataRecord(stats.Payload)
+	todayStatsData := dataRecord(todayStats.Payload)
 	balance := firstNumber(meData, []string{"balance"})
 	totalRecharged := firstNumber(meData, []string{"total_recharged"})
 	if totalRecharged == nil || *totalRecharged == 0 {
@@ -1302,11 +1319,19 @@ func (s *PlatformService) fetchSub2APIMetrics(session Session) (Metrics, error) 
 	}
 	return Metrics{
 		Balance:         metric(balance),
-		TodayConsume:    metric(firstNumber(statsData, []string{"today_actual_cost"})),
+		TodayConsume:    metric(firstNumber(todayStatsData, []string{"total_actual_cost", "totalActualCost", "actual_cost", "actualCost", "cost"})),
 		HistoryRecharge: metric(totalRecharged),
 		Group:           firstGroup,
 		Groups:          groups,
 	}, nil
+}
+
+func sub2APIShanghaiToday() string {
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		shanghai = time.FixedZone("Asia/Shanghai", 8*60*60)
+	}
+	return time.Now().In(shanghai).Format("2006-01-02")
 }
 
 func cookieHeader(headers http.Header) string {

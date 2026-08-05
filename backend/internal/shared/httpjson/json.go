@@ -1,10 +1,15 @@
 package httpjson
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 )
+
+// MaxRequestBodyBytes 是普通 JSON API 的统一请求体上限。
+const MaxRequestBodyBytes int64 = 1 << 20
 
 type ErrorResponse struct {
 	Message string `json:"message"`
@@ -21,13 +26,24 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 }
 
 func Decode(r *http.Request, target any) error {
-	decoder := json.NewDecoder(r.Body)
+	data, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > MaxRequestBodyBytes {
+		return errors.New("JSON request body too large")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return err
 	}
-	if decoder.More() {
-		return errors.New("invalid JSON body")
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("invalid JSON body")
+		}
+		return err
 	}
 	return nil
 }

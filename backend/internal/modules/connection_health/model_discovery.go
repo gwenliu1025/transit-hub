@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"transithub/backend/internal/modules/upstream"
+	"transithub/backend/internal/security/egress"
 )
 
 // 本文件实现手动一次性探活弹窗打开时的 server-only 模型发现：用当前 admin session 临时解析
@@ -32,7 +33,12 @@ type ModelDiscoveryRunner struct {
 }
 
 func NewModelDiscoveryRunner() *ModelDiscoveryRunner {
-	return &ModelDiscoveryRunner{client: &http.Client{Timeout: modelDiscoveryTimeout}}
+	return &ModelDiscoveryRunner{client: egress.NewPublicHTTPSClient(modelDiscoveryTimeout, nil)}
+}
+
+// NewModelDiscoveryRunnerWithClient 允许测试显式注入本地 HTTP client；生产默认构造器保持公网 HTTPS 策略。
+func NewModelDiscoveryRunnerWithClient(client *http.Client) *ModelDiscoveryRunner {
+	return &ModelDiscoveryRunner{client: client}
 }
 
 // openAIModelListResponse 兼容常见 OpenAI 结构：{"data":[{"id":"...","owned_by":"..."}]}。

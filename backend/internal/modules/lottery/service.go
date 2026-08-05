@@ -884,6 +884,13 @@ func (s *Service) requireEmbedSession(ctx context.Context, token string) (*Embed
 	if session == nil {
 		return nil, requestError(ErrorEmbedSessionInvalid)
 	}
+	config, err := s.repository.GetEmbedConfigByToken(ctx, session.EmbedToken)
+	if err != nil {
+		return nil, err
+	}
+	if config == nil || config.UserID != session.UserID || config.AdminAccountID != session.AdminAccountID || config.Sub2apiSourceOrigin != session.SrcHost {
+		return nil, requestError(ErrorEmbedSessionInvalid)
+	}
 	return session, nil
 }
 func (s *Service) campaignResponse(ctx context.Context, c Campaign, admin bool) (CampaignResponse, error) {

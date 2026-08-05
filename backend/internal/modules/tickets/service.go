@@ -43,6 +43,7 @@ type ticketRepository interface {
 type embedSessionStore interface {
 	Save(ctx context.Context, token string, session EmbedSession) error
 	Get(ctx context.Context, token string) (*EmbedSession, error)
+	DeleteWorkspace(ctx context.Context, userID string, adminAccountID string) error
 }
 
 // sub2APIFetcher 是 Service 对 Sub2API 只读身份接口的依赖，由 *Sub2APIClient 结构性满足。
@@ -76,27 +77,29 @@ type sub2APIAdminClient interface {
 }
 
 type Service struct {
-	repository    ticketRepository
-	sessions      embedSessionStore
-	sub2api       sub2APIFetcher
-	storage       attachmentStorage
-	accounts      AdminAccountResolver
-	adminSessions adminSessionProvider
-	sub2apiAdmin  sub2APIAdminClient
-	newID         idGenerator
-	newToken      idGenerator
-	now           func() time.Time
+	repository      ticketRepository
+	sessions        embedSessionStore
+	sub2api         sub2APIFetcher
+	storage         attachmentStorage
+	accounts        AdminAccountResolver
+	adminSessions   adminSessionProvider
+	sub2apiAdmin    sub2APIAdminClient
+	newID           idGenerator
+	newToken        idGenerator
+	now             func() time.Time
+	validateSrcHost srcHostValidator
 }
 
 func NewService(repository *Repository, sessions *EmbedSessionStore, sub2api *Sub2APIClient, storage *AttachmentStorage) *Service {
 	return &Service{
-		repository: repository,
-		sessions:   sessions,
-		sub2api:    sub2api,
-		storage:    storage,
-		newID:      randomID,
-		newToken:   randomToken,
-		now:        time.Now,
+		repository:      repository,
+		sessions:        sessions,
+		sub2api:         sub2api,
+		storage:         storage,
+		newID:           randomID,
+		newToken:        randomToken,
+		now:             time.Now,
+		validateSrcHost: normalizeSrcHost,
 	}
 }
 
@@ -153,8 +156,15 @@ func (s *Service) CreateEmbedSession(ctx context.Context, req CreateSessionReque
 	// config.AllowedSrcHost 拒绝会话请求，避免历史上被关闭或限制过来源的旧数据继续导致 iframe
 	// 无法访问。字段本身保留在数据库和结构体中用于兼容，只是不再参与这里的判定。
 
-	normalizedSrcHost, err := normalizeSrcHost(req.SrcHost)
+	validator := s.validateSrcHost
+	if validator == nil {
+		validator = normalizeSrcHost
+	}
+	normalizedSrcHost, err := validator(ctx, req.SrcHost)
 	if err != nil {
+		return CreateSessionResponse{}, err
+	}
+	if err := s.validateCurrentSourceBinding(ctx, config.UserID, config.AdminAccountID, normalizedSrcHost); err != nil {
 		return CreateSessionResponse{}, err
 	}
 
@@ -219,7 +229,50 @@ func (s *Service) requireSession(ctx context.Context, sessionToken string) (*Emb
 	if session == nil {
 		return nil, requestError(ErrorEmbedSessionInvalid)
 	}
+	var config *EmbedConfig
+	if strings.TrimSpace(session.EmbedToken) != "" {
+		config, err = s.repository.GetEmbedConfigByToken(ctx, strings.TrimSpace(session.EmbedToken))
+	} else {
+		config, err = s.repository.GetEmbedConfigByWorkspace(ctx, session.UserID, session.AdminAccountID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if config == nil || config.UserID != session.UserID || config.AdminAccountID != session.AdminAccountID {
+		return nil, requestError(ErrorEmbedSessionInvalid)
+	}
+	if err := s.validateCurrentSourceBinding(ctx, session.UserID, session.AdminAccountID, session.SrcHost); err != nil {
+		return nil, requestError(ErrorEmbedSessionInvalid)
+	}
 	return session, nil
+}
+
+// validateCurrentSourceBinding 将客户端/会话中持久化的来源绑定到当前 workspace
+// 的真实 admin 会话。任何 admin 会话缺失、非 Sub2API、BaseURL 无效或来源变化都拒绝。
+func (s *Service) validateCurrentSourceBinding(ctx context.Context, userID, adminAccountID, sourceHost string) error {
+	if s.adminSessions == nil {
+		return requestError(ErrorEmbedSessionInvalid)
+	}
+	validator := s.validateSrcHost
+	if validator == nil {
+		validator = normalizeSrcHost
+	}
+	normalizedSource, err := validator(ctx, sourceHost)
+	if err != nil {
+		return requestError(ErrorEmbedSrcHostMismatch)
+	}
+	adminSession, err := s.adminSessions.RequireSession(ctx, userID, adminAccountID)
+	if err != nil {
+		return requestError(ErrorEmbedSessionInvalid)
+	}
+	adminOrigin, err := validator(ctx, adminSession.BaseURL)
+	if err != nil || adminSession.Platform != upstream.PlatformSub2API {
+		return requestError(ErrorEmbedSrcHostMismatch)
+	}
+	if adminOrigin != normalizedSource {
+		return requestError(ErrorEmbedSrcHostMismatch)
+	}
+	return nil
 }
 
 func (s *Service) ListMyTickets(ctx context.Context, sessionToken string) (EmbedTicketListResponse, error) {
@@ -861,6 +914,9 @@ func (s *Service) RotateEmbedToken(ctx context.Context, userID string) (EmbedCon
 		return EmbedConfig{}, err
 	}
 	if err := s.repository.RotateEmbedToken(ctx, userID, adminAccountID, newToken); err != nil {
+		return EmbedConfig{}, err
+	}
+	if err := s.sessions.DeleteWorkspace(ctx, userID, adminAccountID); err != nil {
 		return EmbedConfig{}, err
 	}
 	return s.GetEmbedConfig(ctx, userID)

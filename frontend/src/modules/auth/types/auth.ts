@@ -9,7 +9,6 @@ export interface EmailCodeRequest {
 
 export interface EmailCodeResponse {
   success: boolean
-  code: string
 }
 
 export interface RegisterRequest {

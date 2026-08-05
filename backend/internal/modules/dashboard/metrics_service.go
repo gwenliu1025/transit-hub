@@ -38,6 +38,14 @@ type MetricsService struct {
 	sessionSync MySiteStateSync
 }
 
+var beijingLocation = func() *time.Location {
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.FixedZone("CST", 8*60*60)
+	}
+	return location
+}()
+
 func (s *MetricsService) SetMySiteSync(sync MySiteStateSync) {
 	s.sessionSync = sync
 }
@@ -121,7 +129,7 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 
 	// 并行获取四项独立数据：今日盈利、站点余额、分组数量、上游指标。
 	// 各 goroutine 出错只记日志、降级为零值，不阻塞整体返回。
-	today := time.Now().Format("2006-01-02")
+	today := beijingMetricDate(time.Now())
 	var (
 		todayProfit     float64
 		siteBalance     float64
@@ -180,17 +188,7 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for _, site := range s.upstreams.List(ctx, userID) {
-			if site.RechargeRate <= 0 {
-				continue
-			}
-			if site.Metrics.TodayConsume.Value != nil {
-				todayPurchase += *site.Metrics.TodayConsume.Value * site.RechargeRate
-			}
-			if site.Metrics.Balance.Value != nil {
-				upstreamBalance += *site.Metrics.Balance.Value * site.RechargeRate
-			}
-		}
+		todayPurchase, upstreamBalance = aggregateUpstreamMetricsForDate(s.upstreams.List(ctx, userID), today)
 	}()
 
 	wg.Wait()
@@ -289,11 +287,7 @@ func (s *MetricsService) snapshotAll(ctx context.Context) {
 		return
 	}
 
-	loc, _ := time.LoadLocation("Asia/Shanghai")
-	if loc == nil {
-		loc = time.UTC
-	}
-	yesterday := time.Now().In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := previousBeijingMetricDate(time.Now())
 
 	for _, ref := range refs {
 		userID := ref.UserID
@@ -339,18 +333,10 @@ func (s *MetricsService) snapshotAll(ctx context.Context) {
 
 		// 上游指标：使用 ListForAccount 显式传入 adminAccountID，
 		// 确保后台调度路径不依赖当前工作区上下文。
-		var todayPurchase, upstreamBalance float64
-		for _, site := range s.upstreams.ListForAccount(ctx, userID, adminAccountID) {
-			if site.RechargeRate <= 0 {
-				continue
-			}
-			if site.Metrics.TodayConsume.Value != nil {
-				todayPurchase += *site.Metrics.TodayConsume.Value * site.RechargeRate
-			}
-			if site.Metrics.Balance.Value != nil {
-				upstreamBalance += *site.Metrics.Balance.Value * site.RechargeRate
-			}
-		}
+		todayPurchase, upstreamBalance := aggregateUpstreamMetricsForDate(
+			s.upstreams.ListForAccount(ctx, userID, adminAccountID),
+			yesterday,
+		)
 
 		result := MetricsResponse{
 			TodayProfit:     todayProfit,
@@ -362,6 +348,36 @@ func (s *MetricsService) snapshotAll(ctx context.Context) {
 		s.upsertSnapshot(ctx, userID, adminAccountID, yesterday, result)
 		log.Printf("dashboard scheduler: snapshot saved user_id=%s admin_account_id=%s date=%s", userID, adminAccountID, yesterday)
 	}
+}
+
+func aggregateUpstreamMetricsForDate(sites []upstream.Response, targetDate string) (todayPurchase, upstreamBalance float64) {
+	for _, site := range sites {
+		if site.RechargeRate <= 0 {
+			continue
+		}
+		if site.Metrics.TodayConsume.Value != nil && syncedOnBeijingDate(site.LastSyncedAt, targetDate) {
+			todayPurchase += *site.Metrics.TodayConsume.Value * site.RechargeRate
+		}
+		if site.Metrics.Balance.Value != nil {
+			upstreamBalance += *site.Metrics.Balance.Value * site.RechargeRate
+		}
+	}
+	return todayPurchase, upstreamBalance
+}
+
+func beijingMetricDate(now time.Time) string {
+	return now.In(beijingLocation).Format("2006-01-02")
+}
+
+func previousBeijingMetricDate(now time.Time) string {
+	return now.In(beijingLocation).AddDate(0, 0, -1).Format("2006-01-02")
+}
+
+func syncedOnBeijingDate(lastSyncedAt *int64, targetDate string) bool {
+	if lastSyncedAt == nil {
+		return false
+	}
+	return time.UnixMilli(*lastSyncedAt).In(beijingLocation).Format("2006-01-02") == targetDate
 }
 
 // upsertSnapshot 将指标写入 dashboard_daily_stats 表。

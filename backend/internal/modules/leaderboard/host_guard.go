@@ -22,7 +22,7 @@ func normalizeSrcHost(value string) (string, error) {
 		trimmed = "https://" + trimmed
 	}
 	parsed, err := url.Parse(trimmed)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || !isAllowedSrcHost(parsed.Hostname()) {
+	if err != nil || parsed.Scheme != "https" || !isAllowedSrcHost(parsed.Hostname()) {
 		return "", requestError(ErrorEmbedInvalidSrcHost)
 	}
 	parsed.Path = ""

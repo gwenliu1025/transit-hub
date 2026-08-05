@@ -80,7 +80,7 @@ export default {
       sendCode: '发送验证码',
       sendingCode: '发送中...',
       codeSent: '已发送',
-      codeSentSuccess: '验证码已发送，请使用 {code} 完成注册。',
+      codeSentSuccess: '验证码已发送，请检查邮箱后完成注册。',
       submit: '注册',
       submitting: '注册中...',
       success: '注册成功，正在打开管理后台...',
@@ -100,6 +100,9 @@ export default {
       invalidCredentials: '邮箱或密码不正确。',
       unauthorized: '登录状态已过期，请重新登录后继续。',
       registrationDisabled: '当前部署已关闭公开注册，请使用管理员账号登录。',
+      registrationEmailUnavailable: '当前部署未配置注册验证码邮件投递，公开注册暂不可用。',
+      loginRateLimited: '登录尝试过于频繁，请稍后重试。',
+      temporarilyUnavailable: '认证服务暂时不可用，请稍后重试。',
       network: '网络异常，请检查连接后重试。',
       unknown: '操作失败，请稍后重试。'
     }

@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"net"
@@ -8,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"transithub/backend/internal/security/egress"
 )
 
 const defaultDisplay = "-"
@@ -29,6 +32,11 @@ func isValidHost(host string) bool {
 		return true
 	}
 	return hostDomainPattern.MatchString(host)
+}
+
+func isPublicHTTPSURL(raw string) bool {
+	_, err := egress.ValidatePublicHTTPS(context.Background(), raw, net.DefaultResolver)
+	return err == nil
 }
 
 func defaultMetrics() Metrics {

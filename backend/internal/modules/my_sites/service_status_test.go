@@ -250,6 +250,77 @@ func testSession(serverURL string) upstream.Session {
 	return upstream.Session{Platform: upstream.PlatformNewAPI, BaseURL: serverURL, Cookie: "cookie", UserID: "user-1"}
 }
 
+func TestValidatedStateFallsBackToExistingSessionWhenRefreshFails(t *testing.T) {
+	verifyCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			http.Error(w, "refresh failed", http.StatusInternalServerError)
+		case "/api/v1/auth/me":
+			verifyCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"role": "admin"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	expiresAt := time.Now().Add(-time.Minute).UnixMilli()
+	original := upstream.Session{
+		Platform: upstream.PlatformSub2API, BaseURL: server.URL,
+		AccessToken: "existing-token", RefreshToken: "expired-refresh", TokenType: "Bearer", ExpiresAt: &expiresAt,
+	}
+	repo := &testStateRepo{}
+	service := NewService(repo, upstream.NewPlatformService(upstream.NewHTTPClient(server.Client())), testUpstreamLookup{})
+	state := &State{UserID: "user-1", AdminAccountID: "admin-1", Session: original}
+
+	validated, err := service.validatedState(context.Background(), state)
+	if err != nil {
+		t.Fatalf("validatedState returned error: %v", err)
+	}
+	if validated.Session.AccessToken != original.AccessToken || validated.Session.RefreshToken != original.RefreshToken {
+		t.Fatalf("expected existing session to be preserved, got %+v", validated.Session)
+	}
+	if verifyCalls != 1 {
+		t.Fatalf("expected existing session to be verified once, got %d calls", verifyCalls)
+	}
+	if len(repo.saves) != 0 {
+		t.Fatalf("expected failed refresh not to save state, got %d saves", len(repo.saves))
+	}
+}
+
+func TestValidatedStateRejectsExistingSessionWhenRefreshAndVerifyFail(t *testing.T) {
+	verifyCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			http.Error(w, "refresh failed", http.StatusInternalServerError)
+		case "/api/v1/auth/me":
+			verifyCalls++
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	expiresAt := time.Now().Add(-time.Minute).UnixMilli()
+	service := NewService(&testStateRepo{}, upstream.NewPlatformService(upstream.NewHTTPClient(server.Client())), testUpstreamLookup{})
+	state := &State{Session: upstream.Session{
+		Platform: upstream.PlatformSub2API, BaseURL: server.URL,
+		AccessToken: "existing-token", RefreshToken: "expired-refresh", TokenType: "Bearer", ExpiresAt: &expiresAt,
+	}}
+
+	_, err := service.validatedState(context.Background(), state)
+	var reqErr requestError
+	if !errors.As(err, &reqErr) || reqErr.Error() != ErrorAdminOnly {
+		t.Fatalf("expected ErrorAdminOnly, got %v", err)
+	}
+	if verifyCalls != 1 {
+		t.Fatalf("expected existing session to be verified once, got %d calls", verifyCalls)
+	}
+}
+
 func TestSaveMappingsPreservesLastAutoPricingRun(t *testing.T) {
 	repo := &testStateRepo{state: &State{
 		UserID:         "user-1",

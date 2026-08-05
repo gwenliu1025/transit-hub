@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -14,10 +15,36 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const defaultEmailCode = "123456"
+const emailCodeValidity = 10 * time.Minute
 
 type Service struct {
-	repository *Repository
+	repository   authRepository
+	emailSender  EmailCodeSender
+	loginLimiter LoginLimiter
+}
+
+type authRepository interface {
+	EnsureSchema(ctx context.Context) error
+	CountUsers(ctx context.Context) (int, error)
+	SaveEmailCode(ctx context.Context, email string, codeHash string, expiresAt time.Time) error
+	LatestEmailCode(ctx context.Context, email string) (*EmailVerification, error)
+	ConsumeEmailCode(ctx context.Context, id string, codeHash string, now time.Time) (bool, error)
+	CreateUser(ctx context.Context, email string, passwordHash string) error
+	PasswordHashByEmail(ctx context.Context, email string) (string, error)
+	UserIDByEmail(ctx context.Context, email string) (string, error)
+	CreateSession(ctx context.Context, userID string, tokenHash string, expiresAt time.Time) error
+	UserIDBySessionToken(ctx context.Context, tokenHash string) (string, error)
+}
+
+// EmailCodeSender 是公开注册前验证码的真实投递边界。未配置时接口必须 fail-closed。
+type EmailCodeSender interface {
+	SendVerificationCode(ctx context.Context, email string, code string) error
+}
+
+type LoginLimiter interface {
+	Check(ctx context.Context, account string, clientIP string) (time.Duration, error)
+	RecordFailure(ctx context.Context, account string, clientIP string) error
+	Reset(ctx context.Context, account string, clientIP string) error
 }
 
 type EmailCodeRequest struct {
@@ -25,8 +52,7 @@ type EmailCodeRequest struct {
 }
 
 type EmailCodeResponse struct {
-	Success bool   `json:"success"`
-	Code    string `json:"code"`
+	Success bool `json:"success"`
 }
 
 type RegisterRequest struct {
@@ -68,8 +94,16 @@ func (e *RequestError) Error() string {
 	return e.Message
 }
 
-func NewService(repository *Repository) *Service {
+func NewService(repository authRepository) *Service {
 	return &Service{repository: repository}
+}
+
+func (s *Service) SetEmailCodeSender(sender EmailCodeSender) {
+	s.emailSender = sender
+}
+
+func (s *Service) SetLoginLimiter(limiter LoginLimiter) {
+	s.loginLimiter = limiter
 }
 
 func (s *Service) EnsureSchema(ctx context.Context) error {
@@ -114,11 +148,21 @@ func (s *Service) RequestEmailCode(ctx context.Context, dto EmailCodeRequest) (E
 		return EmailCodeResponse{}, requestError(http.StatusBadRequest, "auth.errors.emailRequired")
 	}
 
-	// 当前阶段验证码固定为 123456，但仍写入验证码表；以后接入真实邮件时只需替换生成和发送逻辑。
-	if err := s.repository.SaveEmailCode(ctx, email, hashValue(defaultEmailCode), time.Now().Add(10*time.Minute)); err != nil {
+	// 注册前没有可用的真实投递器时明确拒绝，避免生成一个用户永远收不到的验证码。
+	if s.emailSender == nil {
+		return EmailCodeResponse{}, requestError(http.StatusServiceUnavailable, "auth.errors.registrationEmailUnavailable")
+	}
+	code, err := generateEmailCode()
+	if err != nil {
 		return EmailCodeResponse{}, err
 	}
-	return EmailCodeResponse{Success: true, Code: defaultEmailCode}, nil
+	if err := s.emailSender.SendVerificationCode(ctx, email, code); err != nil {
+		return EmailCodeResponse{}, requestError(http.StatusServiceUnavailable, "auth.errors.registrationEmailUnavailable")
+	}
+	if err := s.repository.SaveEmailCode(ctx, email, hashValue(code), time.Now().Add(emailCodeValidity)); err != nil {
+		return EmailCodeResponse{}, err
+	}
+	return EmailCodeResponse{Success: true}, nil
 }
 
 func (s *Service) Register(ctx context.Context, dto RegisterRequest) (TokenResponse, error) {
@@ -128,19 +172,23 @@ func (s *Service) Register(ctx context.Context, dto RegisterRequest) (TokenRespo
 	if email == "" || password == "" || code == "" {
 		return TokenResponse{}, requestError(http.StatusBadRequest, "auth.errors.invalidRegister")
 	}
-	if code != defaultEmailCode {
-		return TokenResponse{}, requestError(http.StatusBadRequest, "auth.errors.invalidCode")
-	}
-
-	// 验证码表记录用于模拟真实邮箱验证码生命周期，防止未请求验证码就直接注册。
+	// 数据库通过带哈希、未消费和未过期条件的单条 UPDATE 原子认领验证码。
 	verification, err := s.repository.LatestEmailCode(ctx, email)
 	if err != nil {
 		return TokenResponse{}, err
 	}
-	if verification == nil || verification.CodeHash != hashValue(defaultEmailCode) || time.Now().After(verification.ExpiresAt) {
+	if verification == nil || time.Now().After(verification.ExpiresAt) {
 		return TokenResponse{}, requestError(http.StatusBadRequest, "auth.errors.invalidCode")
 	}
-	// 密码和验证码分开处理：验证码是临时固定值，密码必须用带盐哈希保存，避免明文或快速哈希落库。
+	consumed, err := s.repository.ConsumeEmailCode(ctx, verification.ID, hashValue(code), time.Now())
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	if !consumed {
+		return TokenResponse{}, requestError(http.StatusBadRequest, "auth.errors.invalidCode")
+	}
+	// 验证码已经原子认领；后续失败时也不恢复，避免重放。客户端可重新申请验证码。
+	// 密码必须用带盐哈希保存，避免明文或快速哈希落库。
 	passwordHash, err := hashPassword(password)
 	if err != nil {
 		return TokenResponse{}, err
@@ -151,24 +199,48 @@ func (s *Service) Register(ctx context.Context, dto RegisterRequest) (TokenRespo
 		}
 		return TokenResponse{}, err
 	}
-	if err := s.repository.ConsumeEmailCode(ctx, verification.ID); err != nil {
-		return TokenResponse{}, err
-	}
 	return s.createSession(ctx, "register", email)
 }
 
-func (s *Service) Login(ctx context.Context, dto LoginRequest) (TokenResponse, error) {
+func (s *Service) Login(ctx context.Context, dto LoginRequest, clientIPs ...string) (TokenResponse, error) {
 	email := normalizeEmail(dto.Email)
 	password := strings.TrimSpace(dto.Password)
 	if email == "" || password == "" {
 		return TokenResponse{}, requestError(http.StatusBadRequest, "auth.errors.invalidLogin")
 	}
+	clientIP := "unknown"
+	if len(clientIPs) > 0 && strings.TrimSpace(clientIPs[0]) != "" {
+		clientIP = strings.TrimSpace(clientIPs[0])
+	}
+	if s.loginLimiter != nil {
+		wait, err := s.loginLimiter.Check(ctx, email, clientIP)
+		if err != nil {
+			return TokenResponse{}, requestError(http.StatusServiceUnavailable, "auth.errors.temporarilyUnavailable")
+		}
+		if wait > 0 {
+			return TokenResponse{}, requestError(http.StatusTooManyRequests, "auth.errors.loginRateLimited")
+		}
+	}
 	passwordHash, err := s.repository.PasswordHashByEmail(ctx, email)
 	if err != nil {
 		return TokenResponse{}, err
 	}
-	if passwordHash == "" || !verifyPassword(passwordHash, password) {
+	valid := passwordHash != "" && verifyPassword(passwordHash, password)
+	if passwordHash == "" {
+		_ = verifyPassword("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", password)
+	}
+	if !valid {
+		if s.loginLimiter != nil {
+			if err := s.loginLimiter.RecordFailure(ctx, email, clientIP); err != nil {
+				return TokenResponse{}, requestError(http.StatusServiceUnavailable, "auth.errors.temporarilyUnavailable")
+			}
+		}
 		return TokenResponse{}, requestError(http.StatusUnauthorized, "auth.errors.invalidCredentials")
+	}
+	if s.loginLimiter != nil {
+		if err := s.loginLimiter.Reset(ctx, email, clientIP); err != nil {
+			return TokenResponse{}, requestError(http.StatusServiceUnavailable, "auth.errors.temporarilyUnavailable")
+		}
 	}
 	return s.createSession(ctx, "login", email)
 }
@@ -244,6 +316,14 @@ func randomToken(bytesCount int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(data), nil
+}
+
+func generateEmailCode() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(1000000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", n.Int64()), nil
 }
 
 func requestError(status int, message string) *RequestError {

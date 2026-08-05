@@ -22,6 +22,13 @@ func TestProtectedPathDoesNotOvermatchMassEmailLookalikes(t *testing.T) {
 	}
 }
 
+func TestProtectedPathIncludesUsersDirectory(t *testing.T) {
+	server := &Server{}
+	if !server.protectedPath("/api/users") {
+		t.Fatal("用户目录接口必须经过全局认证中间件")
+	}
+}
+
 func TestProtectedPathIncludesLeaderboardAdminPrefix(t *testing.T) {
 	server := &Server{}
 	for _, path := range []string{"/api/leaderboard/data", "/api/leaderboard/embed-config", "/api/leaderboard/embed-config/rotate-token"} {

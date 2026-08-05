@@ -629,7 +629,7 @@ func TestGroups_NoRealConnectionsShowsNotConnected(t *testing.T) {
 	mySites := fakeMySitesReader{
 		ownGroups: []my_sites.MappingOwnGroupOption{{ID: "g1", GroupName: "group-one"}},
 	}
-	svc := &Service{repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: NewRealProbeRunner()}
+	svc := &Service{repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: newTestRealProbeRunner()}
 
 	groups, err := svc.Groups(context.Background(), "user1")
 	if err != nil {
@@ -662,7 +662,7 @@ func TestGroups_SiblingConnectionsInSameGroupAreIndependent(t *testing.T) {
 			{ID: "conn-suspended", OwnGroupIDs: []string{"g1"}, UpstreamKey: "super-secret-key-2"},
 		},
 	}
-	svc := &Service{repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: NewRealProbeRunner()}
+	svc := &Service{repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: newTestRealProbeRunner()}
 
 	groups, err := svc.Groups(context.Background(), "user1")
 	if err != nil {
@@ -698,7 +698,7 @@ func TestGroups_NeverLeaksUpstreamKey(t *testing.T) {
 			{ID: "conn-1", OwnGroupIDs: []string{"g1"}, UpstreamKey: secretKey, UpstreamKeyID: "key-id-1"},
 		},
 	}
-	svc := &Service{repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: NewRealProbeRunner()}
+	svc := &Service{repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: newTestRealProbeRunner()}
 
 	groups, err := svc.Groups(context.Background(), "user1")
 	if err != nil {
@@ -723,7 +723,7 @@ func TestOverview_CountsByState(t *testing.T) {
 		ownGroups:   []my_sites.MappingOwnGroupOption{{ID: "g1", GroupName: "group-one"}},
 		connections: []my_sites.RealConnection{{ID: "conn-1", OwnGroupIDs: []string{"g1"}}},
 	}
-	svc := &Service{repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: NewRealProbeRunner()}
+	svc := &Service{repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: newTestRealProbeRunner()}
 
 	overview, err := svc.Overview(context.Background(), "user1")
 	if err != nil {
@@ -861,7 +861,7 @@ func newProbeTestService(t *testing.T) (*Service, *fakeRepository, *httptest.Ser
 	}
 	svc := &Service{
 		repo: repo, mySites: mySites, sites: fakeSiteLookup{site: &upstream.Site{ID: "site-1", BaseURL: server.URL}},
-		accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: NewRealProbeRunner(),
+		accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: noopRemoteActionRunner{}, probeRunner: newTestRealProbeRunner(),
 	}
 	return svc, repo, server
 }

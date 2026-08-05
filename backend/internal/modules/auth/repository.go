@@ -58,13 +58,19 @@ func (r *Repository) LatestEmailCode(ctx context.Context, email string) (*EmailV
 	return &verification, nil
 }
 
-func (r *Repository) ConsumeEmailCode(ctx context.Context, id string) error {
-	_, err := r.db.Exec(ctx, `
+func (r *Repository) ConsumeEmailCode(ctx context.Context, id string, codeHash string, now time.Time) (bool, error) {
+	result, err := r.db.Exec(ctx, `
 		UPDATE email_verification_codes
-		SET "consumedAt" = $2
+		SET "consumedAt" = $3
 		WHERE id = $1
-	`, id, time.Now())
-	return err
+		  AND "codeHash" = $2
+		  AND "consumedAt" IS NULL
+		  AND "expiresAt" > $3
+	`, id, codeHash, now)
+	if err != nil {
+		return false, err
+	}
+	return result.RowsAffected() == 1, nil
 }
 
 func (r *Repository) CreateUser(ctx context.Context, email string, passwordHash string) error {

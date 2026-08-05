@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// fakeSiteCache 是 SiteCache 的内存实现，仅供测试使用。
+// fakeSiteCache 鏄?SiteCache 鐨勫唴瀛樺疄鐜帮紝浠呬緵娴嬭瘯浣跨敤銆?
 type fakeSiteCache struct {
 	sites map[string]*Site
 }
@@ -55,7 +55,7 @@ func (f *fakeSiteCache) ListByUser(ctx context.Context, userID string) ([]*Site,
 
 func (f *fakeSiteCache) Flush(ctx context.Context) error { return nil }
 
-// fakeAccountResolver 是 AdminAccountResolver 的内存实现，按 userID 返回固定的当前工作区。
+// fakeAccountResolver 鏄?AdminAccountResolver 鐨勫唴瀛樺疄鐜帮紝鎸?userID 杩斿洖鍥哄畾鐨勫綋鍓嶅伐浣滃尯銆?
 type fakeAccountResolver struct {
 	current map[string]string
 }
@@ -68,7 +68,7 @@ func (f *fakeAccountResolver) RequireCurrentID(ctx context.Context, userID strin
 	return id, nil
 }
 
-// sub2APIKeyServer 启动一个最小 sub2api httptest server：单页 key 列表 + 固定今日消费。
+// sub2APIKeyServer 鍚姩涓€涓渶灏?sub2api httptest server锛氬崟椤?key 鍒楄〃 + 鍥哄畾浠婃棩娑堣垂銆?
 func sub2APIKeyServer(t *testing.T, keyID string, keyName string, groupName string, todayCost float64) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -98,8 +98,8 @@ func newTestSite(id, userID, adminAccountID string, rechargeRate float64, sessio
 	}
 }
 
-// TestServiceKeyUsageToday_WorkspaceIsolation 覆盖测试要求 1：只返回当前工作区站点的数据，
-// 其他工作区（即使同一用户名下）的站点不得混入结果。
+// TestServiceKeyUsageToday_WorkspaceIsolation 瑕嗙洊娴嬭瘯瑕佹眰 1锛氬彧杩斿洖褰撳墠宸ヤ綔鍖虹珯鐐圭殑鏁版嵁锛?
+// 鍏朵粬宸ヤ綔鍖猴紙鍗充娇鍚屼竴鐢ㄦ埛鍚嶄笅锛夌殑绔欑偣涓嶅緱娣峰叆缁撴灉銆?
 func TestServiceKeyUsageToday_WorkspaceIsolation(t *testing.T) {
 	serverA := sub2APIKeyServer(t, "1", "key-a", "vip", 10)
 	defer serverA.Close()
@@ -110,7 +110,7 @@ func TestServiceKeyUsageToday_WorkspaceIsolation(t *testing.T) {
 	cache.add(newTestSite("site-a", "user-1", "acc-1", 2, &Session{Platform: PlatformSub2API, BaseURL: serverA.URL, AccessToken: "token"}))
 	cache.add(newTestSite("site-b", "user-1", "acc-2", 2, &Session{Platform: PlatformSub2API, BaseURL: serverB.URL, AccessToken: "token"}))
 
-	svc := NewService(NewPlatformService(NewHTTPClient(http.DefaultClient)), nil, nil, cache)
+	svc := NewService(newTestPlatformService(http.DefaultClient), nil, nil, cache)
 	svc.SetAdminAccountResolver(&fakeAccountResolver{current: map[string]string{"user-1": "acc-1"}})
 
 	items, err := svc.KeyUsageToday(context.Background(), "user-1")
@@ -125,8 +125,8 @@ func TestServiceKeyUsageToday_WorkspaceIsolation(t *testing.T) {
 	}
 }
 
-// TestServiceKeyUsageToday_SkipsRechargeRateZero 验证 rechargeRate <= 0 的站点被整体跳过，
-// 与 dashboard.MetricsService.LiveMetrics() 中 todayPurchase 的口径保持一致。
+// TestServiceKeyUsageToday_SkipsRechargeRateZero 楠岃瘉 rechargeRate <= 0 鐨勭珯鐐硅鏁翠綋璺宠繃锛?
+// 涓?dashboard.MetricsService.LiveMetrics() 涓?todayPurchase 鐨勫彛寰勪繚鎸佷竴鑷淬€?
 func TestServiceKeyUsageToday_SkipsRechargeRateZero(t *testing.T) {
 	server := sub2APIKeyServer(t, "1", "key-a", "vip", 10)
 	defer server.Close()
@@ -134,7 +134,7 @@ func TestServiceKeyUsageToday_SkipsRechargeRateZero(t *testing.T) {
 	cache := newFakeSiteCache()
 	cache.add(newTestSite("site-a", "user-1", "acc-1", 0, &Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token"}))
 
-	svc := NewService(NewPlatformService(NewHTTPClient(http.DefaultClient)), nil, nil, cache)
+	svc := NewService(newTestPlatformService(http.DefaultClient), nil, nil, cache)
 	svc.SetAdminAccountResolver(&fakeAccountResolver{current: map[string]string{"user-1": "acc-1"}})
 
 	items, err := svc.KeyUsageToday(context.Background(), "user-1")
@@ -146,8 +146,8 @@ func TestServiceKeyUsageToday_SkipsRechargeRateZero(t *testing.T) {
 	}
 }
 
-// TestServiceKeyUsageToday_FiltersZeroCostAndAppliesRechargeRate 覆盖测试要求 2 和字段换算：
-// 0 消费的 key 被过滤；剩余 key 的 todayAmount = 上游原始金额 * rechargeRate。
+// TestServiceKeyUsageToday_FiltersZeroCostAndAppliesRechargeRate 瑕嗙洊娴嬭瘯瑕佹眰 2 鍜屽瓧娈垫崲绠楋細
+// 0 娑堣垂鐨?key 琚繃婊わ紱鍓╀綑 key 鐨?todayAmount = 涓婃父鍘熷閲戦 * rechargeRate銆?
 func TestServiceKeyUsageToday_FiltersZeroCostAndAppliesRechargeRate(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -172,7 +172,7 @@ func TestServiceKeyUsageToday_FiltersZeroCostAndAppliesRechargeRate(t *testing.T
 	cache := newFakeSiteCache()
 	cache.add(newTestSite("site-a", "user-1", "acc-1", 2, &Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token"}))
 
-	svc := NewService(NewPlatformService(NewHTTPClient(http.DefaultClient)), nil, nil, cache)
+	svc := NewService(newTestPlatformService(http.DefaultClient), nil, nil, cache)
 	svc.SetAdminAccountResolver(&fakeAccountResolver{current: map[string]string{"user-1": "acc-1"}})
 
 	items, err := svc.KeyUsageToday(context.Background(), "user-1")
@@ -193,8 +193,8 @@ func TestServiceKeyUsageToday_FiltersZeroCostAndAppliesRechargeRate(t *testing.T
 	}
 }
 
-// TestServiceKeyUsageToday_ExternalErrorFailsClosed 覆盖测试要求 9：
-// 外部平台请求失败时整个方法返回错误，不能把失败站点悄悄当 0 处理。
+// TestServiceKeyUsageToday_ExternalErrorFailsClosed 瑕嗙洊娴嬭瘯瑕佹眰 9锛?
+// 澶栭儴骞冲彴璇锋眰澶辫触鏃舵暣涓柟娉曡繑鍥為敊璇紝涓嶈兘鎶婂け璐ョ珯鐐规倓鎮勫綋 0 澶勭悊銆?
 func TestServiceKeyUsageToday_ExternalErrorFailsClosed(t *testing.T) {
 	failingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -204,7 +204,7 @@ func TestServiceKeyUsageToday_ExternalErrorFailsClosed(t *testing.T) {
 	cache := newFakeSiteCache()
 	cache.add(newTestSite("site-a", "user-1", "acc-1", 2, &Session{Platform: PlatformSub2API, BaseURL: failingServer.URL, AccessToken: "token"}))
 
-	svc := NewService(NewPlatformService(NewHTTPClient(http.DefaultClient)), nil, nil, cache)
+	svc := NewService(newTestPlatformService(http.DefaultClient), nil, nil, cache)
 	svc.SetAdminAccountResolver(&fakeAccountResolver{current: map[string]string{"user-1": "acc-1"}})
 
 	_, err := svc.KeyUsageToday(context.Background(), "user-1")
@@ -213,8 +213,8 @@ func TestServiceKeyUsageToday_ExternalErrorFailsClosed(t *testing.T) {
 	}
 }
 
-// TestServiceKeyUsageToday_PartialFailureKeepsSuccessfulItems 验证多站点采集时，
-// 单个站点失败不会丢弃其他站点已经取得的数据，同时返回可识别的失败站点计数。
+// TestServiceKeyUsageToday_PartialFailureKeepsSuccessfulItems 楠岃瘉澶氱珯鐐归噰闆嗘椂锛?
+// 鍗曚釜绔欑偣澶辫触涓嶄細涓㈠純鍏朵粬绔欑偣宸茬粡鍙栧緱鐨勬暟鎹紝鍚屾椂杩斿洖鍙瘑鍒殑澶辫触绔欑偣璁℃暟銆?
 func TestServiceKeyUsageToday_PartialFailureKeepsSuccessfulItems(t *testing.T) {
 	successServer := sub2APIKeyServer(t, "1", "working-key", "vip", 10)
 	defer successServer.Close()
@@ -227,7 +227,7 @@ func TestServiceKeyUsageToday_PartialFailureKeepsSuccessfulItems(t *testing.T) {
 	cache.add(newTestSite("site-success", "user-1", "acc-1", 2, &Session{Platform: PlatformSub2API, BaseURL: successServer.URL, AccessToken: "token"}))
 	cache.add(newTestSite("site-failure", "user-1", "acc-1", 2, &Session{Platform: PlatformSub2API, BaseURL: failingServer.URL, AccessToken: "token"}))
 
-	svc := NewService(NewPlatformService(NewHTTPClient(http.DefaultClient)), nil, nil, cache)
+	svc := NewService(newTestPlatformService(http.DefaultClient), nil, nil, cache)
 	svc.SetAdminAccountResolver(&fakeAccountResolver{current: map[string]string{"user-1": "acc-1"}})
 
 	items, err := svc.KeyUsageToday(context.Background(), "user-1")
@@ -243,9 +243,9 @@ func TestServiceKeyUsageToday_PartialFailureKeepsSuccessfulItems(t *testing.T) {
 	}
 }
 
-// TestServiceBalanceBreakdown_SortsDescendingWithUnknownBalanceLast 覆盖测试要求 7、8：
-// 按 balance 降序排序，未知余额（rechargeRate<=0）站点排在最后；total 等于已知余额之和，
-// 与 LiveMetrics 中 upstreamBalance 的计算口径一致（rechargeRate<=0 站点不计入 total）。
+// TestServiceBalanceBreakdown_SortsDescendingWithUnknownBalanceLast 瑕嗙洊娴嬭瘯瑕佹眰 7銆?锛?
+// 鎸?balance 闄嶅簭鎺掑簭锛屾湭鐭ヤ綑棰濓紙rechargeRate<=0锛夌珯鐐规帓鍦ㄦ渶鍚庯紱total 绛変簬宸茬煡浣欓涔嬪拰锛?
+// 涓?LiveMetrics 涓?upstreamBalance 鐨勮绠楀彛寰勪竴鑷达紙rechargeRate<=0 绔欑偣涓嶈鍏?total锛夈€?
 func TestServiceBalanceBreakdown_SortsDescendingWithUnknownBalanceLast(t *testing.T) {
 	highBalance := 50.0
 	lowBalance := 5.0
@@ -259,10 +259,10 @@ func TestServiceBalanceBreakdown_SortsDescendingWithUnknownBalanceLast(t *testin
 	siteLow.Metrics.Balance.Value = &lowBalance
 	cache.add(siteLow)
 
-	siteUnknown := newTestSite("site-unknown", "user-1", "acc-1", 0, nil) // rechargeRate<=0 => 未知余额
+	siteUnknown := newTestSite("site-unknown", "user-1", "acc-1", 0, nil) // rechargeRate<=0 => 鏈煡浣欓
 	cache.add(siteUnknown)
 
-	svc := NewService(NewPlatformService(NewHTTPClient(http.DefaultClient)), nil, nil, cache)
+	svc := NewService(newTestPlatformService(http.DefaultClient), nil, nil, cache)
 	svc.SetAdminAccountResolver(&fakeAccountResolver{current: map[string]string{"user-1": "acc-1"}})
 
 	items, err := svc.BalanceBreakdown(context.Background(), "user-1")
@@ -273,8 +273,8 @@ func TestServiceBalanceBreakdown_SortsDescendingWithUnknownBalanceLast(t *testin
 		t.Fatalf("expected all 3 sites (unknown balance sites are shown, not omitted), got %d", len(items))
 	}
 
-	// Service 层不排序（排序由 dashboard.MetricsService.UpstreamBalanceBreakdown 完成），
-	// 这里只校验数据本身：已知余额已换算为 CNY，未知余额为 nil。
+	// Service 灞備笉鎺掑簭锛堟帓搴忕敱 dashboard.MetricsService.UpstreamBalanceBreakdown 瀹屾垚锛夛紝
+	// 杩欓噷鍙牎楠屾暟鎹湰韬細宸茬煡浣欓宸叉崲绠椾负 CNY锛屾湭鐭ヤ綑棰濅负 nil銆?
 	byID := map[string]*BalanceBreakdownItem{}
 	for i := range items {
 		byID[items[i].SiteID] = &items[i]

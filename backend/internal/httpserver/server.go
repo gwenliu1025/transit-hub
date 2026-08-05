@@ -1,9 +1,11 @@
 package httpserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -30,6 +32,7 @@ import (
 	"transithub/backend/internal/modules/tickets"
 	"transithub/backend/internal/modules/upstream"
 	"transithub/backend/internal/modules/users"
+	"transithub/backend/internal/security/egress"
 	"transithub/backend/internal/shared/authctx"
 	"transithub/backend/internal/shared/httpjson"
 )
@@ -59,6 +62,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 
 	health.RegisterRoutes(server.mux)
 	authService := auth.NewService(auth.NewRepository(db))
+	authService.SetLoginLimiter(auth.NewRedisLoginLimiter(redisClient))
 	server.authService = authService
 	if err := authService.EnsureSchema(context.Background()); err != nil {
 		panic(err)
@@ -81,7 +85,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 		panic(err)
 	}
 	group_rates.RegisterRoutes(server.mux, groupRatesService, adminAccountsService)
-	upstreamHTTPClient := &http.Client{Timeout: upstreamRequestTimeout}
+	upstreamHTTPClient := egress.NewPublicHTTPSClient(upstreamRequestTimeout, nil)
 	platformService := upstream.NewPlatformService(upstream.NewHTTPClient(upstreamHTTPClient))
 	upstreamCache := upstream.NewRedisSiteCache(redisClient)
 	upstreamService := upstream.NewService(platformService, upstreamRepository, groupRateSnapshotWriter{service: groupRatesService}, upstreamCache)
@@ -100,7 +104,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	if err := ticketsRepository.EnsureSchema(context.Background()); err != nil {
 		panic(err)
 	}
-	ticketsSub2APIClient := tickets.NewSub2APIClient(&http.Client{Timeout: upstreamRequestTimeout})
+	ticketsSub2APIClient := tickets.NewSub2APIClient(egress.NewPublicHTTPSClient(upstreamRequestTimeout, nil))
 	ticketsSessions := tickets.NewEmbedSessionStore(redisClient)
 	ticketsStorage, err := tickets.NewAttachmentStorage(cfg.TicketUploadDir)
 	if err != nil {
@@ -144,7 +148,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	server.lotteryFrameAncestorOrigin = lotteryService.FrameAncestorOrigin
 	lottery.RegisterRoutes(server.mux, lotteryService)
 
-	settingsService := settings.NewService(http.DefaultClient, settings.NewRepository(db))
+	settingsService := settings.NewService(egress.NewPublicHTTPSClient(upstreamRequestTimeout, nil), settings.NewRepository(db))
 	settingsService.SetAdminAccountResolver(adminAccountsService)
 	if err := settingsService.EnsureSchema(context.Background()); err != nil {
 		panic(err)
@@ -246,22 +250,26 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	connHealthService.StartScheduler(context.Background())
 
 	// 策略设置变更时通知上游服务更新定时同步配置。
-	applyRefreshConfig := func(s settings.StrategySettings) {
-		upstreamService.SetRefreshConfig(upstream.RefreshConfig{
+	applyRefreshConfig := func(userID, adminAccountID string, s settings.StrategySettings) {
+		upstreamService.SetWorkspaceRefreshConfig(userID, adminAccountID, upstream.RefreshConfig{
 			Enabled:  s.EnableRefreshInterval,
 			Interval: time.Duration(s.RefreshInterval) * time.Second,
 		})
 	}
 	settingsService.OnStrategyChanged = applyRefreshConfig
 
-	// 启动时读取已保存的策略设置，按配置决定是否开启定时同步。
-	if strategy, err := settingsService.GetFirstStrategy(context.Background()); err == nil {
-		applyRefreshConfig(strategy)
+	// 启动时读取所有工作区的策略设置，分别恢复对应的定时同步配置。
+	if strategies, err := settingsService.ListStrategies(context.Background()); err == nil {
+		for _, strategy := range strategies {
+			applyRefreshConfig(strategy.UserID, strategy.AdminAccountID, strategy.Settings)
+		}
+	} else {
+		log.Printf("[settings] 启动时加载工作区策略失败: %v", err)
 	}
 
 	// 站点同步成功后检查余额预警和倍率变更，按配置发送通知。
 	upstreamService.AfterSync = func(ctx context.Context, userID, adminAccountID, siteID, siteName string, oldMetrics, newMetrics upstream.Metrics) {
-		strategy, err := settingsService.GetFirstStrategy(ctx)
+		strategy, err := settingsService.GetStrategyForAccount(ctx, userID, adminAccountID)
 		if err != nil {
 			return
 		}
@@ -405,6 +413,9 @@ func (s *Server) Handler() http.Handler {
 			static.ServeHTTP(w, r)
 			return
 		}
+		if limitJSONRequestBody(w, r) {
+			return
+		}
 		if s.protectedPath(r.URL.Path) {
 			user, err := s.authService.CurrentUser(r.Context(), bearerToken(r.Header.Get("Authorization")))
 			if err != nil {
@@ -415,6 +426,29 @@ func (s *Server) Handler() http.Handler {
 		}
 		s.mux.ServeHTTP(w, r)
 	})))
+}
+
+// limitJSONRequestBody 在进入具体 API handler 前为 JSON 请求体建立统一的硬上限。
+// multipart 上传由 tickets/settings 等模块自行按文件语义限制，不能套用 JSON 上限。
+func limitJSONRequestBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.Body == nil || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "application/json") {
+		return false
+	}
+	if r.ContentLength > httpjson.MaxRequestBodyBytes {
+		httpjson.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return true
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, httpjson.MaxRequestBodyBytes+1))
+	if err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return true
+	}
+	if int64(len(data)) > httpjson.MaxRequestBodyBytes {
+		httpjson.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return true
+	}
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	return false
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -439,7 +473,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) protectedPath(path string) bool {
-	return strings.HasPrefix(path, "/api/admin-accounts") || strings.HasPrefix(path, "/api/upstream-sites") || strings.HasPrefix(path, "/api/group-rates") || strings.HasPrefix(path, "/api/group-rate-campaigns") || strings.HasPrefix(path, "/api/my-sites") || strings.HasPrefix(path, "/api/settings") || strings.HasPrefix(path, "/api/dashboard") || strings.HasPrefix(path, "/api/system") || strings.HasPrefix(path, "/api/connection-health") || strings.HasPrefix(path, "/api/tickets") || strings.HasPrefix(path, "/api/leaderboard") || strings.HasPrefix(path, "/api/lottery") || strings.HasPrefix(path, "/api/mass-email")
+	return strings.HasPrefix(path, "/api/users") || strings.HasPrefix(path, "/api/admin-accounts") || strings.HasPrefix(path, "/api/upstream-sites") || strings.HasPrefix(path, "/api/group-rates") || strings.HasPrefix(path, "/api/group-rate-campaigns") || strings.HasPrefix(path, "/api/my-sites") || strings.HasPrefix(path, "/api/settings") || strings.HasPrefix(path, "/api/dashboard") || strings.HasPrefix(path, "/api/system") || strings.HasPrefix(path, "/api/connection-health") || strings.HasPrefix(path, "/api/tickets") || strings.HasPrefix(path, "/api/leaderboard") || strings.HasPrefix(path, "/api/lottery") || strings.HasPrefix(path, "/api/mass-email")
 }
 
 func (s *Server) setSecurityHeaders(w http.ResponseWriter, r *http.Request) {

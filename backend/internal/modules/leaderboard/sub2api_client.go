@@ -40,7 +40,11 @@ func NewSub2APIClient(client *http.Client) *Sub2APIClient {
 // The caller never stores the viewer token; only the returned identity snapshot
 // is persisted in the short-lived Redis session.
 func (c *Sub2APIClient) FetchCurrentUser(srcHost string, token string) (Sub2APIUser, error) {
-	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(srcHost, "/")+"/api/v1/auth/me", nil)
+	normalizedHost, err := normalizeSrcHost(srcHost)
+	if err != nil {
+		return Sub2APIUser{}, &sub2APIError{detail: "invalid sub2api source host"}
+	}
+	req, err := http.NewRequest(http.MethodGet, normalizedHost+"/api/v1/auth/me", nil)
 	if err != nil {
 		return Sub2APIUser{}, &sub2APIError{detail: "build sub2api request failed"}
 	}
