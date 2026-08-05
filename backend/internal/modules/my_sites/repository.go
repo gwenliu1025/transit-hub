@@ -95,6 +95,30 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	_, err = r.db.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS real_connection_operations (
+			id text PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+			user_id text NOT NULL,
+			workspace_admin_account_id text NOT NULL,
+			operation_id text NOT NULL,
+			request_hash text NOT NULL,
+			owner_token text NOT NULL DEFAULT '',
+			status text NOT NULL DEFAULT 'reserved',
+			connection_id text NOT NULL DEFAULT '',
+			remote_upstream_key_id text NOT NULL DEFAULT '',
+			remote_admin_resource_id text NOT NULL DEFAULT '',
+			last_error text NOT NULL DEFAULT '',
+			compensation_error text NOT NULL DEFAULT '',
+			attempt_count integer NOT NULL DEFAULT 1,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			CONSTRAINT real_connection_operations_unique_intent UNIQUE (user_id, workspace_admin_account_id, operation_id),
+			CONSTRAINT real_connection_operations_status_check CHECK (status IN ('reserved', 'provisioning', 'succeeded', 'failed', 'compensation_failed'))
+		)
+	`)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -369,6 +393,13 @@ type realConnectionScanner interface {
 	Scan(dest ...any) error
 }
 
+const realConnectionSelectSQL = `
+	SELECT id, user_id, workspace_admin_account_id, upstream_site_id, upstream_group_id, upstream_group_name,
+	       upstream_key_id, upstream_key, admin_account_id, admin_account_name,
+	       own_group_ids, own_group_names, group_type, provisioning_mode, status,
+	       upstream_platform, admin_platform, pricing_mapping_enabled, operation_id, created_at
+	FROM real_connections`
+
 func scanRealConnection(row realConnectionScanner) (*RealConnection, error) {
 	var conn RealConnection
 	var ownGroupIDsJSON []byte
@@ -457,6 +488,213 @@ func (r *Repository) GetRealConnectionByOperationID(ctx context.Context, userID 
 		return nil, nil
 	}
 	return conn, err
+}
+
+// ReserveRealConnectionOperation 使用行锁原子占位幂等意图。只有返回 Owned=true
+// 的请求可以进入远端创建；provisioning/compensation_failed 状态永不被盲目接管。
+func (r *Repository) ReserveRealConnectionOperation(ctx context.Context, userID, adminAccountID, operationID, requestHash, ownerToken string) (RealConnectionOperationClaim, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return RealConnectionOperationClaim{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	var op RealConnectionOperation
+	err = tx.QueryRow(ctx, `
+		SELECT user_id, workspace_admin_account_id, operation_id, request_hash, owner_token,
+			status, remote_upstream_key_id, remote_admin_resource_id, last_error, compensation_error, updated_at
+		FROM real_connection_operations
+		WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3
+		FOR UPDATE
+	`, userID, adminAccountID, operationID).Scan(
+		&op.UserID, &op.AdminAccountID, &op.OperationID, &op.RequestHash, &op.OwnerToken,
+		&op.Status, &op.UpstreamKeyID, &op.AdminResourceID, &op.LastError, &op.CompensationError, &op.UpdatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		commandTag, err := tx.Exec(ctx, `
+			INSERT INTO real_connection_operations (user_id, workspace_admin_account_id, operation_id, request_hash, owner_token, status)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (user_id, workspace_admin_account_id, operation_id) DO NOTHING
+		`, userID, adminAccountID, operationID, requestHash, ownerToken, RealConnectionOperationReserved)
+		if err != nil {
+			return RealConnectionOperationClaim{}, err
+		}
+		if commandTag.RowsAffected() == 0 {
+			if err := tx.Commit(ctx); err != nil {
+				return RealConnectionOperationClaim{}, err
+			}
+			committed = true
+			return r.ReserveRealConnectionOperation(ctx, userID, adminAccountID, operationID, requestHash, ownerToken)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return RealConnectionOperationClaim{}, err
+		}
+		committed = true
+		return RealConnectionOperationClaim{Owned: true, Status: RealConnectionOperationReserved}, nil
+	}
+	if err != nil {
+		return RealConnectionOperationClaim{}, err
+	}
+	if op.RequestHash != requestHash {
+		// 迁移导入的已完成旧记录没有可重建的完整请求哈希；仍应按
+		// operation_id 返回原结果，保证滚动升级期间的历史重试兼容。
+		if !(op.Status == RealConnectionOperationSucceeded && op.RequestHash == "") {
+			return RealConnectionOperationClaim{}, ErrRealConnectionOperationConflict
+		}
+	}
+	if op.Status == RealConnectionOperationSucceeded {
+		conn, err := scanRealConnection(tx.QueryRow(ctx, realConnectionSelectSQL+` WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3`, userID, adminAccountID, operationID))
+		if err != nil {
+			return RealConnectionOperationClaim{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return RealConnectionOperationClaim{}, err
+		}
+		committed = true
+		return RealConnectionOperationClaim{Status: op.Status, Connection: conn}, nil
+	}
+	if op.Status == RealConnectionOperationReserved && time.Since(op.UpdatedAt) > 30*time.Second {
+		if _, err := tx.Exec(ctx, `
+			UPDATE real_connection_operations
+			SET owner_token = $4, attempt_count = attempt_count + 1, updated_at = now()
+			WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3
+		`, userID, adminAccountID, operationID, ownerToken); err != nil {
+			return RealConnectionOperationClaim{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return RealConnectionOperationClaim{}, err
+		}
+		committed = true
+		return RealConnectionOperationClaim{Owned: true, Status: RealConnectionOperationReserved}, nil
+	}
+	if op.Status == RealConnectionOperationFailed && op.CompensationError == "" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE real_connection_operations
+			SET owner_token = $4, status = $5, attempt_count = attempt_count + 1,
+				remote_upstream_key_id = '', remote_admin_resource_id = '',
+				last_error = '', compensation_error = '', updated_at = now()
+			WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3
+		`, userID, adminAccountID, operationID, ownerToken, RealConnectionOperationReserved); err != nil {
+			return RealConnectionOperationClaim{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return RealConnectionOperationClaim{}, err
+		}
+		committed = true
+		return RealConnectionOperationClaim{Owned: true, Status: RealConnectionOperationReserved}, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return RealConnectionOperationClaim{}, err
+	}
+	committed = true
+	return RealConnectionOperationClaim{Status: op.Status}, nil
+}
+
+func (r *Repository) MarkRealConnectionOperationProvisioning(ctx context.Context, userID, adminAccountID, operationID, ownerToken string) error {
+	commandTag, err := r.db.Exec(ctx, `
+		UPDATE real_connection_operations
+		SET status = $5, updated_at = now()
+		WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3
+			AND owner_token = $4 AND status = $6
+	`, userID, adminAccountID, operationID, ownerToken, RealConnectionOperationProvisioning, RealConnectionOperationReserved)
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() == 0 {
+		return ErrRealConnectionOperationNotOwner
+	}
+	return nil
+}
+
+func (r *Repository) RecordRealConnectionOperationRemote(ctx context.Context, userID, adminAccountID, operationID, ownerToken, upstreamKeyID, adminResourceID string) error {
+	commandTag, err := r.db.Exec(ctx, `
+		UPDATE real_connection_operations
+		SET remote_upstream_key_id = CASE WHEN $5 <> '' THEN $5 ELSE remote_upstream_key_id END,
+			remote_admin_resource_id = CASE WHEN $6 <> '' THEN $6 ELSE remote_admin_resource_id END,
+			updated_at = now()
+		WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3
+			AND owner_token = $4 AND status = $7
+	`, userID, adminAccountID, operationID, ownerToken, upstreamKeyID, adminResourceID, RealConnectionOperationProvisioning)
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() == 0 {
+		return ErrRealConnectionOperationNotOwner
+	}
+	return nil
+}
+
+func (r *Repository) CompleteRealConnectionOperation(ctx context.Context, userID, adminAccountID, operationID, ownerToken string, conn RealConnection) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM real_connection_operations WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3 AND owner_token = $4 FOR UPDATE`, userID, adminAccountID, operationID, ownerToken).Scan(&status); err != nil {
+		if err == pgx.ErrNoRows {
+			return ErrRealConnectionOperationNotOwner
+		}
+		return err
+	}
+	if status != RealConnectionOperationProvisioning {
+		return ErrRealConnectionOperationNotOwner
+	}
+	if conn.PricingMappingEnabled {
+		state, err := scanState(tx.QueryRow(ctx, `SELECT user_id, admin_account_id, base_url, email, session, mappings, own_groups FROM my_site_states WHERE user_id = $1 AND admin_account_id = $2 FOR UPDATE`, conn.UserID, conn.WorkspaceAdminAccountID))
+		if err != nil {
+			return err
+		}
+		if state == nil {
+			return fmt.Errorf("save real connection: workspace state not found")
+		}
+		addMappingTargetForOwnGroups(state, conn.OwnGroupNames, UpstreamGroupRef{SiteID: conn.UpstreamSiteID, GroupName: conn.UpstreamGroupName})
+		if err := updateStateInTx(ctx, tx, *state); err != nil {
+			return err
+		}
+	}
+	if err := insertRealConnection(ctx, tx, conn); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE real_connection_operations
+		SET status = $5, connection_id = $4, updated_at = now()
+		WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3 AND owner_token = $6
+	`, userID, adminAccountID, operationID, conn.ID, RealConnectionOperationSucceeded, ownerToken); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (r *Repository) FailRealConnectionOperation(ctx context.Context, userID, adminAccountID, operationID, ownerToken, status, lastError, compensationError, upstreamKeyID, adminResourceID string) error {
+	commandTag, err := r.db.Exec(ctx, `
+		UPDATE real_connection_operations
+		SET status = $5, last_error = $6, compensation_error = $7,
+			remote_upstream_key_id = CASE WHEN $8 <> '' THEN $8 ELSE remote_upstream_key_id END,
+			remote_admin_resource_id = CASE WHEN $9 <> '' THEN $9 ELSE remote_admin_resource_id END,
+			updated_at = now()
+		WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3 AND owner_token = $4
+	`, userID, adminAccountID, operationID, ownerToken, status, lastError, compensationError, upstreamKeyID, adminResourceID)
+	if err != nil {
+		return err
+	}
+	if commandTag.RowsAffected() == 0 {
+		return ErrRealConnectionOperationNotOwner
+	}
+	return nil
 }
 
 // DeleteRealConnection 根据 ID 和用户 ID 删除一条真实对接绑定记录。

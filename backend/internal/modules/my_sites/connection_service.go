@@ -2,8 +2,13 @@ package my_sites
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +38,57 @@ func normalizeOperationID(value string) (string, error) {
 		return "", requestError(ErrorRequest)
 	}
 	return value, nil
+}
+
+// connectionOperationIdentity 为真实对接请求生成可重试的幂等身份。
+// 客户端未提供 operationId 时，使用规范化请求内容派生稳定标识；列表顺序不影响意图。
+func connectionOperationIdentity(userID, adminAccountID string, req RealConnectRequest) (string, string, error) {
+	return operationIdentity("real-connect", userID, adminAccountID, req.OperationID, struct {
+		UpstreamSiteID    string   `json:"upstreamSiteId"`
+		UpstreamGroupID   string   `json:"upstreamGroupId"`
+		UpstreamGroupName string   `json:"upstreamGroupName"`
+		GroupType         string   `json:"groupType"`
+		ChannelType       int      `json:"channelType"`
+		OwnGroupIDs       []string `json:"ownGroupIds"`
+		AddToPricing      bool     `json:"addToPricingMapping"`
+	}{
+		UpstreamSiteID: strings.TrimSpace(req.UpstreamSiteID), UpstreamGroupID: strings.TrimSpace(req.UpstreamGroupID),
+		UpstreamGroupName: strings.TrimSpace(req.UpstreamGroupName), GroupType: strings.TrimSpace(req.GroupType),
+		ChannelType: req.ChannelType, OwnGroupIDs: sortedTrimmed(req.OwnGroupIDs), AddToPricing: addToPricingMapping(req.AddToPricingMapping),
+	})
+}
+
+func operationIdentity(kind, userID, adminAccountID, supplied string, payload any) (string, string, error) {
+	encoded, err := json.Marshal(struct {
+		Kind           string `json:"kind"`
+		UserID         string `json:"userId"`
+		AdminAccountID string `json:"adminAccountId"`
+		Payload        any    `json:"payload"`
+	}{kind, strings.TrimSpace(userID), strings.TrimSpace(adminAccountID), payload})
+	if err != nil {
+		return "", "", err
+	}
+	sum := sha256.Sum256(encoded)
+	hash := hex.EncodeToString(sum[:])
+	operationID, err := normalizeOperationID(strings.TrimSpace(supplied))
+	if err != nil {
+		return "", "", err
+	}
+	if operationID == "" {
+		operationID = kind + "-" + hash
+	}
+	return operationID, hash, nil
+}
+
+func sortedTrimmed(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 func (s *Service) prepareConnectionContext(ctx context.Context, userID, siteID, groupID, groupName, requestedType string, requireAdminResourceType bool) (connectionContext, error) {
@@ -145,18 +201,13 @@ func (s *Service) realConnectManaged(ctx context.Context, userID string, req Rea
 	if strings.TrimSpace(req.UpstreamSiteID) == "" || strings.TrimSpace(req.UpstreamGroupID) == "" || len(req.OwnGroupIDs) == 0 {
 		return RealConnectResponse{}, requestError(ErrorRequest)
 	}
-	operationID, err := normalizeOperationID(req.OperationID)
-	if err != nil {
-		return RealConnectResponse{}, err
-	}
 	connectionCtx, err := s.prepareConnectionContext(ctx, userID, req.UpstreamSiteID, req.UpstreamGroupID, req.UpstreamGroupName, req.GroupType, true)
 	if err != nil {
 		return RealConnectResponse{}, err
 	}
-	if existing, err := s.idempotentConnection(ctx, userID, connectionCtx.adminAccountID, operationID); err != nil {
+	operationID, requestHash, err := connectionOperationIdentity(userID, connectionCtx.adminAccountID, req)
+	if err != nil {
 		return RealConnectResponse{}, err
-	} else if existing != nil {
-		return RealConnectResponse{Connection: publicRealConnection(*existing)}, nil
 	}
 	if err := s.rejectDuplicateTarget(ctx, userID, connectionCtx.adminAccountID, req.UpstreamSiteID, req.UpstreamGroupID, connectionCtx.groupName); err != nil {
 		return RealConnectResponse{}, err
@@ -164,6 +215,35 @@ func (s *Service) realConnectManaged(ctx context.Context, userID string, req Rea
 	ownGroupIDs, ownGroupNames, err := s.resolveAdminGroups(ctx, connectionCtx.state, req.OwnGroupIDs)
 	if err != nil {
 		return RealConnectResponse{}, err
+	}
+	operationStore, hasOperationStore := s.connRepository.(RealConnectionOperationRepository)
+	ownerToken, err := randomConnID()
+	if err != nil {
+		return RealConnectResponse{}, err
+	}
+	if hasOperationStore {
+		claim, claimErr := operationStore.ReserveRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, requestHash, ownerToken)
+		if claimErr != nil {
+			if errors.Is(claimErr, ErrRealConnectionOperationConflict) {
+				return RealConnectResponse{}, requestError(ErrorRequest)
+			}
+			return RealConnectResponse{}, claimErr
+		}
+		if claim.Connection != nil {
+			return RealConnectResponse{Connection: publicRealConnection(*claim.Connection)}, nil
+		}
+		if !claim.Owned {
+			return RealConnectResponse{}, requestError(ErrorRequest)
+		}
+	} else if existing, err := s.idempotentConnection(ctx, userID, connectionCtx.adminAccountID, operationID); err != nil {
+		return RealConnectResponse{}, err
+	} else if existing != nil {
+		return RealConnectResponse{Connection: publicRealConnection(*existing)}, nil
+	}
+	if hasOperationStore {
+		if err := operationStore.MarkRealConnectionOperationProvisioning(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken); err != nil {
+			return RealConnectResponse{}, err
+		}
 	}
 
 	connID, err := randomConnID()
@@ -173,22 +253,68 @@ func (s *Service) realConnectManaged(ctx context.Context, userID string, req Rea
 	resourceName := fmt.Sprintf("%s-%s-%s", randomKeyPrefix(), connectionCtx.upstreamSite.Name, connectionCtx.groupName)
 	keyID, key, err := s.createUpstreamCredential(connectionCtx.upstreamSession, resourceName, req.UpstreamGroupID)
 	if err != nil {
+		if hasOperationStore {
+			_ = operationStore.FailRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, RealConnectionOperationFailed, err.Error(), "", keyID, "")
+		}
 		return RealConnectResponse{}, err
 	}
-	rollbackKey := func() {
-		if rollbackErr := s.deleteUpstreamCredential(connectionCtx.upstreamSession, keyID); rollbackErr != nil {
+	rollbackKeyErr := func() error {
+		rollbackErr := s.deleteUpstreamCredential(connectionCtx.upstreamSession, keyID)
+		if rollbackErr != nil {
 			log.Printf("[real-connect] compensate upstream credential failed platform=%s id=%s err=%v", connectionCtx.upstreamSession.Platform, keyID, rollbackErr)
+		}
+		return rollbackErr
+	}
+	if hasOperationStore {
+		if err := operationStore.RecordRealConnectionOperationRemote(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, keyID, ""); err != nil {
+			compensationErr := rollbackKeyErr()
+			status, compText := RealConnectionOperationFailed, ""
+			if compensationErr != nil {
+				status, compText = RealConnectionOperationCompensationFailed, compensationErr.Error()
+			}
+			_ = operationStore.FailRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, status, err.Error(), compText, keyID, "")
+			return RealConnectResponse{}, err
 		}
 	}
 
 	adminResourceID, adminResourceName, err := s.createAdminResource(connectionCtx, req.ChannelType, ownGroupIDs, key)
 	if err != nil {
-		rollbackKey()
+		compensationErr := rollbackKeyErr()
+		if hasOperationStore {
+			status, compText := RealConnectionOperationFailed, ""
+			if compensationErr != nil {
+				status, compText = RealConnectionOperationCompensationFailed, compensationErr.Error()
+			}
+			_ = operationStore.FailRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, status, err.Error(), compText, keyID, adminResourceID)
+		}
 		return RealConnectResponse{}, err
 	}
-	rollbackAdmin := func() {
-		if rollbackErr := s.deleteAdminResource(connectionCtx.state.Session, adminResourceID); rollbackErr != nil {
+	rollbackAdminErr := func() error {
+		rollbackErr := s.deleteAdminResource(connectionCtx.state.Session, adminResourceID)
+		if rollbackErr != nil {
 			log.Printf("[real-connect] compensate admin resource failed platform=%s id=%s err=%v", connectionCtx.state.Session.Platform, adminResourceID, rollbackErr)
+		}
+		return rollbackErr
+	}
+	if hasOperationStore {
+		if err := operationStore.RecordRealConnectionOperationRemote(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, keyID, adminResourceID); err != nil {
+			adminRollbackErr := rollbackAdminErr()
+			keyRollbackErr := rollbackKeyErr()
+			status, compText := RealConnectionOperationFailed, ""
+			if adminRollbackErr != nil || keyRollbackErr != nil {
+				status = RealConnectionOperationCompensationFailed
+				if adminRollbackErr != nil {
+					compText = adminRollbackErr.Error()
+				}
+				if keyRollbackErr != nil {
+					if compText != "" {
+						compText += "; "
+					}
+					compText += keyRollbackErr.Error()
+				}
+			}
+			_ = operationStore.FailRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, status, err.Error(), compText, keyID, adminResourceID)
+			return RealConnectResponse{}, err
 		}
 	}
 
@@ -215,10 +341,34 @@ func (s *Service) realConnectManaged(ctx context.Context, userID string, req Rea
 		CanDeleteRemote:         true,
 		CreatedAt:               time.Now().Format(time.RFC3339),
 	}
-	if err := s.persistConnection(ctx, conn); err != nil {
-		rollbackAdmin()
-		rollbackKey()
-		return RealConnectResponse{}, err
+	var persistErr error
+	if hasOperationStore {
+		persistErr = operationStore.CompleteRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, conn)
+	} else {
+		persistErr = s.persistConnection(ctx, conn)
+	}
+	if persistErr != nil {
+		adminRollbackErr := rollbackAdminErr()
+		keyRollbackErr := rollbackKeyErr()
+		if hasOperationStore {
+			status, compText := RealConnectionOperationFailed, ""
+			var compensationErr error
+			if adminRollbackErr != nil {
+				compensationErr = adminRollbackErr
+			}
+			if keyRollbackErr != nil {
+				if compensationErr == nil {
+					compensationErr = keyRollbackErr
+				} else {
+					compensationErr = fmt.Errorf("%v; %w", compensationErr, keyRollbackErr)
+				}
+			}
+			if compensationErr != nil {
+				status, compText = RealConnectionOperationCompensationFailed, compensationErr.Error()
+			}
+			_ = operationStore.FailRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, status, persistErr.Error(), compText, keyID, adminResourceID)
+		}
+		return RealConnectResponse{}, persistErr
 	}
 	return RealConnectResponse{Connection: publicRealConnection(conn)}, nil
 }
@@ -514,7 +664,6 @@ func (s *Service) realBindExisting(ctx context.Context, userID string, req RealB
 	if err != nil {
 		return RealConnectResponse{}, err
 	}
-
 	connID, err := randomConnID()
 	if err != nil {
 		return RealConnectResponse{}, err

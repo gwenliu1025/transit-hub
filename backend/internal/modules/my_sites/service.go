@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -46,6 +47,53 @@ type AtomicRealConnectionRepository interface {
 
 type IdempotentRealConnectionRepository interface {
 	GetRealConnectionByOperationID(ctx context.Context, userID string, adminAccountID string, operationID string) (*RealConnection, error)
+}
+
+const (
+	RealConnectionOperationReserved           = "reserved"
+	RealConnectionOperationProvisioning       = "provisioning"
+	RealConnectionOperationSucceeded          = "succeeded"
+	RealConnectionOperationFailed             = "failed"
+	RealConnectionOperationCompensationFailed = "compensation_failed"
+)
+
+var (
+	ErrRealConnectionOperationConflict = errors.New("real connection operation request conflict")
+	ErrRealConnectionOperationNotOwner = errors.New("real connection operation owner mismatch")
+)
+
+// RealConnectionOperation records the durable intent and every remote resource
+// observed while provisioning it. It is deliberately separate from
+// real_connections so a crash cannot make a retry look like a new intent.
+type RealConnectionOperation struct {
+	UserID            string
+	AdminAccountID    string
+	OperationID       string
+	RequestHash       string
+	OwnerToken        string
+	Status            string
+	UpstreamKeyID     string
+	AdminResourceID   string
+	LastError         string
+	CompensationError string
+	UpdatedAt         time.Time
+}
+
+type RealConnectionOperationClaim struct {
+	Owned      bool
+	Status     string
+	Connection *RealConnection
+}
+
+// RealConnectionOperationRepository atomically reserves an operation before
+// any remote side effect and persists its audit state through completion or
+// compensation. Implementations must scope every method by user/workspace.
+type RealConnectionOperationRepository interface {
+	ReserveRealConnectionOperation(ctx context.Context, userID, adminAccountID, operationID, requestHash, ownerToken string) (RealConnectionOperationClaim, error)
+	MarkRealConnectionOperationProvisioning(ctx context.Context, userID, adminAccountID, operationID, ownerToken string) error
+	RecordRealConnectionOperationRemote(ctx context.Context, userID, adminAccountID, operationID, ownerToken, upstreamKeyID, adminResourceID string) error
+	CompleteRealConnectionOperation(ctx context.Context, userID, adminAccountID, operationID, ownerToken string, conn RealConnection) error
+	FailRealConnectionOperation(ctx context.Context, userID, adminAccountID, operationID, ownerToken, status, lastError, compensationError, upstreamKeyID, adminResourceID string) error
 }
 
 type ScopedRealDisconnectRepository interface {
