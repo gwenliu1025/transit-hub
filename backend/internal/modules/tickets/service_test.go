@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -349,7 +350,12 @@ func newTestService(repo *fakeTicketRepository, sessions *fakeSessionStore, sub2
 			if !strings.HasPrefix(trimmed, "https://") || strings.Contains(trimmed, "@") {
 				return "", requestError(ErrorEmbedInvalidSrcHost)
 			}
-			return strings.TrimRight(trimmed, "/"), nil
+			parsed, err := url.Parse(trimmed)
+			if err != nil || parsed.Hostname() == "" {
+				return "", requestError(ErrorEmbedInvalidSrcHost)
+			}
+			parsed.Path, parsed.RawQuery, parsed.Fragment = "", "", ""
+			return strings.TrimRight(parsed.String(), "/"), nil
 		},
 	}
 }

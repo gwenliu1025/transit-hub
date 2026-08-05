@@ -253,7 +253,11 @@ func (s *Service) validateCurrentSourceBinding(ctx context.Context, userID, admi
 	if s.adminSessions == nil {
 		return requestError(ErrorEmbedSessionInvalid)
 	}
-	normalizedSource, err := normalizeSrcHost(sourceHost)
+	validator := s.validateSrcHost
+	if validator == nil {
+		validator = normalizeSrcHost
+	}
+	normalizedSource, err := validator(ctx, sourceHost)
 	if err != nil {
 		return requestError(ErrorEmbedSrcHostMismatch)
 	}
@@ -261,7 +265,7 @@ func (s *Service) validateCurrentSourceBinding(ctx context.Context, userID, admi
 	if err != nil {
 		return requestError(ErrorEmbedSessionInvalid)
 	}
-	adminOrigin, err := normalizeSrcHost(adminSession.BaseURL)
+	adminOrigin, err := validator(ctx, adminSession.BaseURL)
 	if err != nil || adminSession.Platform != upstream.PlatformSub2API {
 		return requestError(ErrorEmbedSrcHostMismatch)
 	}
