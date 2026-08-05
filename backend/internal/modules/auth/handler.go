@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"net"
 	"net/http"
+	"strings"
 
 	"transithub/backend/internal/shared/httpjson"
 )
@@ -64,12 +66,20 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		httpjson.WriteError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	response, err := h.service.Login(r.Context(), dto)
+	response, err := h.service.Login(r.Context(), dto, requestClientIP(r))
 	if err != nil {
 		writeAuthError(w, err)
 		return
 	}
 	httpjson.Write(w, http.StatusOK, response)
+}
+
+func requestClientIP(r *http.Request) string {
+	remoteAddr := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 func (h *Handler) loginWithPassword(w http.ResponseWriter, r *http.Request) {

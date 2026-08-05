@@ -59,6 +59,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 
 	health.RegisterRoutes(server.mux)
 	authService := auth.NewService(auth.NewRepository(db))
+	authService.SetLoginLimiter(auth.NewRedisLoginLimiter(redisClient))
 	server.authService = authService
 	if err := authService.EnsureSchema(context.Background()); err != nil {
 		panic(err)

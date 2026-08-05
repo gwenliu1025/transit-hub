@@ -80,7 +80,7 @@ export default {
       sendCode: 'Send Code',
       sendingCode: 'Sending...',
       codeSent: 'Sent',
-      codeSentSuccess: 'Verification code sent. Use {code} to finish registration.',
+      codeSentSuccess: 'Verification code sent. Check your email to finish registration.',
       submit: 'Register',
       submitting: 'Registering...',
       success: 'Registration complete. Opening the admin console...',
@@ -100,6 +100,9 @@ export default {
       invalidCredentials: 'Email or password is incorrect.',
       unauthorized: 'Your session has expired. Please sign in again to continue.',
       registrationDisabled: 'Public registration is disabled for this deployment. Sign in with the admin account.',
+      registrationEmailUnavailable: 'Registration email delivery is not configured for this deployment. Public registration is unavailable.',
+      loginRateLimited: 'Too many login attempts. Try again later.',
+      temporarilyUnavailable: 'Authentication is temporarily unavailable. Try again later.',
       network: 'Network error. Check your connection and try again.',
       unknown: 'Something went wrong. Please try again.'
     }

@@ -16,20 +16,17 @@ const code = ref('')
 const isLoading = ref(false)
 const isSendingCode = ref(false)
 const statusKey = ref<string | null>(null)
-const statusParams = ref<Record<string, string>>({})
 const errorKey = ref<string | null>(null)
 
 const handleSendCode = async () => {
   if (!email.value) return
   isSendingCode.value = true
   statusKey.value = null
-  statusParams.value = {}
   errorKey.value = null
 
   try {
-    const response = await requestEmailCode({ email: email.value })
+    await requestEmailCode({ email: email.value })
     statusKey.value = 'auth.register.codeSentSuccess'
-    statusParams.value = { code: response.code }
   } catch (error) {
     errorKey.value = error instanceof Error ? error.message : 'auth.errors.unknown'
   } finally {
@@ -40,7 +37,6 @@ const handleSendCode = async () => {
 const handleRegister = async () => {
   isLoading.value = true
   statusKey.value = null
-  statusParams.value = {}
   errorKey.value = null
 
   try {
@@ -149,7 +145,7 @@ const handleRegister = async () => {
             v-if="statusKey"
             class="rounded-xl border border-signal/20 bg-signal/10 px-4 py-3 text-sm font-medium text-signal"
           >
-            {{ t(statusKey, statusParams) }}
+            {{ t(statusKey) }}
           </p>
 
           <p
