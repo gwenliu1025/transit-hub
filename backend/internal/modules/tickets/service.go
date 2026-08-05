@@ -43,6 +43,7 @@ type ticketRepository interface {
 type embedSessionStore interface {
 	Save(ctx context.Context, token string, session EmbedSession) error
 	Get(ctx context.Context, token string) (*EmbedSession, error)
+	DeleteWorkspace(ctx context.Context, userID string, adminAccountID string) error
 }
 
 // sub2APIFetcher 是 Service 对 Sub2API 只读身份接口的依赖，由 *Sub2APIClient 结构性满足。
@@ -218,6 +219,15 @@ func (s *Service) requireSession(ctx context.Context, sessionToken string) (*Emb
 	}
 	if session == nil {
 		return nil, requestError(ErrorEmbedSessionInvalid)
+	}
+	if strings.TrimSpace(session.EmbedToken) != "" {
+		config, err := s.repository.GetEmbedConfigByToken(ctx, session.EmbedToken)
+		if err != nil {
+			return nil, err
+		}
+		if config == nil || config.UserID != session.UserID || config.AdminAccountID != session.AdminAccountID {
+			return nil, requestError(ErrorEmbedSessionInvalid)
+		}
 	}
 	return session, nil
 }
@@ -861,6 +871,9 @@ func (s *Service) RotateEmbedToken(ctx context.Context, userID string) (EmbedCon
 		return EmbedConfig{}, err
 	}
 	if err := s.repository.RotateEmbedToken(ctx, userID, adminAccountID, newToken); err != nil {
+		return EmbedConfig{}, err
+	}
+	if err := s.sessions.DeleteWorkspace(ctx, userID, adminAccountID); err != nil {
 		return EmbedConfig{}, err
 	}
 	return s.GetEmbedConfig(ctx, userID)

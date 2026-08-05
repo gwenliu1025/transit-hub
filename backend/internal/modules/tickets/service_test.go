@@ -232,6 +232,15 @@ func (f *fakeSessionStore) Get(ctx context.Context, token string) (*EmbedSession
 	return &cp, nil
 }
 
+func (f *fakeSessionStore) DeleteWorkspace(_ context.Context, userID string, adminAccountID string) error {
+	for token, session := range f.sessions {
+		if session.UserID == userID && session.AdminAccountID == adminAccountID {
+			delete(f.sessions, token)
+		}
+	}
+	return nil
+}
+
 // fakeSub2API 是 sub2APIFetcher 的假实现，按测试用例预设固定返回值/错误。
 type fakeSub2API struct {
 	user Sub2APIUser
