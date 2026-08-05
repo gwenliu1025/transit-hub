@@ -34,9 +34,9 @@ func NewPlatformService(httpClient *HTTPClient) *PlatformService {
 	return &PlatformService{httpClient: httpClient, validateURL: isPublicHTTPSURL}
 }
 
-// NewPlatformServiceWithURLValidator 仅用于测试显式注入 URL 校验器，生产路径必须使用
+// newPlatformServiceWithURLValidator 仅供包内测试显式注入 URL 校验器；生产路径必须使用
 // NewPlatformService 的公网 HTTPS 默认策略。
-func NewPlatformServiceWithURLValidator(httpClient *HTTPClient, validateURL func(string) bool) *PlatformService {
+func newPlatformServiceWithURLValidator(httpClient *HTTPClient, validateURL func(string) bool) *PlatformService {
 	if validateURL == nil {
 		validateURL = isPublicHTTPSURL
 	}
