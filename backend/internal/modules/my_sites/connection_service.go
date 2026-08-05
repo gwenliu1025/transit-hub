@@ -351,10 +351,10 @@ func safeCredentialPreview(value string) string {
 	if value == "" {
 		return ""
 	}
-	if len(value) <= 12 {
-		return value
+	if len(value) <= 4 {
+		return strings.Repeat("*", len(value))
 	}
-	return value[:6] + "..." + value[len(value)-4:]
+	return value[:2] + "..." + value[len(value)-2:]
 }
 
 // ListAdminResources lists existing accounts/channels in one current-admin
