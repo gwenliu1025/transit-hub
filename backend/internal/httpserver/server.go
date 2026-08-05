@@ -1,9 +1,11 @@
 package httpserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -411,6 +413,9 @@ func (s *Server) Handler() http.Handler {
 			static.ServeHTTP(w, r)
 			return
 		}
+		if limitJSONRequestBody(w, r) {
+			return
+		}
 		if s.protectedPath(r.URL.Path) {
 			user, err := s.authService.CurrentUser(r.Context(), bearerToken(r.Header.Get("Authorization")))
 			if err != nil {
@@ -421,6 +426,29 @@ func (s *Server) Handler() http.Handler {
 		}
 		s.mux.ServeHTTP(w, r)
 	})))
+}
+
+// limitJSONRequestBody 在进入具体 API handler 前为 JSON 请求体建立统一的硬上限。
+// multipart 上传由 tickets/settings 等模块自行按文件语义限制，不能套用 JSON 上限。
+func limitJSONRequestBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.Body == nil || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "application/json") {
+		return false
+	}
+	if r.ContentLength > httpjson.MaxRequestBodyBytes {
+		httpjson.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return true
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, httpjson.MaxRequestBodyBytes+1))
+	if err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return true
+	}
+	if int64(len(data)) > httpjson.MaxRequestBodyBytes {
+		httpjson.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return true
+	}
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	return false
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
