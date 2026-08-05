@@ -19,6 +19,11 @@
 
 ## 待修复问题
 
+本次加固分支的逐项实现状态、回归命令和未证明项见
+[`2026-08-05-security-hardening-validation.md`](2026-08-05-security-hardening-validation.md)。
+原始 23 项仍保留在下文作为审计基线；其中验证码因注册前没有邮件投递上下文标记为 mitigated，
+Lottery 撤销因 PostgreSQL/Redis 非同一事务标记为 mitigated，其余代码边界已加入回归测试。
+
 | 优先级 | Family | 问题 | 关键位置 |
 | --- | --- | --- | --- |
 | P0 | `connection-health-model-discovery-ssrf` | 模型发现向未经过网络策略校验的 BaseURL 发送上游 Bearer key | `backend/internal/modules/upstream/probe_credentials.go` |
