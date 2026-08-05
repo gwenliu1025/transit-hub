@@ -9,6 +9,14 @@
 - 未部署生产，未读取或提交生产 `.env`、数据库、Redis、备份、token 或 API key。
 - 统计面板“北京时间跨日后每日成本多算约 14 至 15 元”的问题属于此前生产修复基线，不与下面的待修复清单混淆。
 
+## 部署阶段已修复缺陷
+
+- `000018_connection_health_strategy_mode.sql` 原先假定旧策略表已有 `priority_mode`，
+  但 `v0.1.7` 运行时创建的生产表没有该列，导致升级迁移确定性失败。
+- 已先增加失败回归测试，再让迁移自身在兼容回填前补齐 `priority_mode`；
+  使用生产 PostgreSQL dump 和 Redis RDB 的隔离升级演练通过后，发布为
+  `v0.1.15-xiaoqian.2`。
+
 ## 待修复问题
 
 | 优先级 | Family | 问题 | 关键位置 |
