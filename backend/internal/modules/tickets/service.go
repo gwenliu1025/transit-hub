@@ -77,27 +77,29 @@ type sub2APIAdminClient interface {
 }
 
 type Service struct {
-	repository    ticketRepository
-	sessions      embedSessionStore
-	sub2api       sub2APIFetcher
-	storage       attachmentStorage
-	accounts      AdminAccountResolver
-	adminSessions adminSessionProvider
-	sub2apiAdmin  sub2APIAdminClient
-	newID         idGenerator
-	newToken      idGenerator
-	now           func() time.Time
+	repository      ticketRepository
+	sessions        embedSessionStore
+	sub2api         sub2APIFetcher
+	storage         attachmentStorage
+	accounts        AdminAccountResolver
+	adminSessions   adminSessionProvider
+	sub2apiAdmin    sub2APIAdminClient
+	newID           idGenerator
+	newToken        idGenerator
+	now             func() time.Time
+	validateSrcHost srcHostValidator
 }
 
 func NewService(repository *Repository, sessions *EmbedSessionStore, sub2api *Sub2APIClient, storage *AttachmentStorage) *Service {
 	return &Service{
-		repository: repository,
-		sessions:   sessions,
-		sub2api:    sub2api,
-		storage:    storage,
-		newID:      randomID,
-		newToken:   randomToken,
-		now:        time.Now,
+		repository:      repository,
+		sessions:        sessions,
+		sub2api:         sub2api,
+		storage:         storage,
+		newID:           randomID,
+		newToken:        randomToken,
+		now:             time.Now,
+		validateSrcHost: normalizeSrcHost,
 	}
 }
 
@@ -154,7 +156,11 @@ func (s *Service) CreateEmbedSession(ctx context.Context, req CreateSessionReque
 	// config.AllowedSrcHost 拒绝会话请求，避免历史上被关闭或限制过来源的旧数据继续导致 iframe
 	// 无法访问。字段本身保留在数据库和结构体中用于兼容，只是不再参与这里的判定。
 
-	normalizedSrcHost, err := normalizeSrcHost(req.SrcHost)
+	validator := s.validateSrcHost
+	if validator == nil {
+		validator = normalizeSrcHost
+	}
+	normalizedSrcHost, err := validator(ctx, req.SrcHost)
 	if err != nil {
 		return CreateSessionResponse{}, err
 	}

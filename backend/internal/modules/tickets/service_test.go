@@ -344,6 +344,13 @@ func newTestService(repo *fakeTicketRepository, sessions *fakeSessionStore, sub2
 		newID:    sequentialIDs("id"),
 		newToken: sequentialIDs("token"),
 		now:      time.Now,
+		validateSrcHost: func(_ context.Context, raw string) (string, error) {
+			trimmed := strings.TrimSpace(raw)
+			if !strings.HasPrefix(trimmed, "https://") || strings.Contains(trimmed, "@") {
+				return "", requestError(ErrorEmbedInvalidSrcHost)
+			}
+			return strings.TrimRight(trimmed, "/"), nil
+		},
 	}
 }
 

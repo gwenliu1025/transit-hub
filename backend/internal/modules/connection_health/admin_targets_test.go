@@ -20,7 +20,7 @@ func newAdminTargetsRemoteActionService(reader PlatformGroupReader, mySites MySi
 		mySites:        mySites,
 		accounts:       fakeAdminAccountResolver{id: "ws1"},
 		dispatcher:     newRemoteActionDispatcher(fakeSiteLookup{}, fakeSessionProvider{}, platform),
-		probeRunner:    NewRealProbeRunner(),
+		probeRunner:    newTestRealProbeRunner(),
 		platformGroups: reader,
 	}
 }
@@ -240,7 +240,7 @@ func TestProbeTargetOnce_Sub2APIRealPlatformServiceComboDegradeSucceeds(t *testi
 	svc := &Service{
 		repo: repo, mySites: mySites, accounts: fakeAdminAccountResolver{id: "ws1"},
 		dispatcher:     newRemoteActionDispatcher(fakeSiteLookup{}, fakeSessionProvider{}, realPlatform),
-		probeRunner:    NewRealProbeRunner(),
+		probeRunner:    newTestRealProbeRunner(),
 		platformGroups: reader,
 	}
 

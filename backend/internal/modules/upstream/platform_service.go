@@ -26,11 +26,21 @@ func jsonMarshal(v any) ([]byte, error) {
 const refreshSkewMS int64 = 60_000
 
 type PlatformService struct {
-	httpClient *HTTPClient
+	httpClient  *HTTPClient
+	validateURL func(string) bool
 }
 
 func NewPlatformService(httpClient *HTTPClient) *PlatformService {
-	return &PlatformService{httpClient: httpClient}
+	return &PlatformService{httpClient: httpClient, validateURL: isPublicHTTPSURL}
+}
+
+// NewPlatformServiceWithURLValidator 仅用于测试显式注入 URL 校验器，生产路径必须使用
+// NewPlatformService 的公网 HTTPS 默认策略。
+func NewPlatformServiceWithURLValidator(httpClient *HTTPClient, validateURL func(string) bool) *PlatformService {
+	if validateURL == nil {
+		validateURL = isPublicHTTPSURL
+	}
+	return &PlatformService{httpClient: httpClient, validateURL: validateURL}
 }
 
 // newAPIAuthOptions supports both legacy cookie sessions and system access tokens.
@@ -66,8 +76,8 @@ func (s *PlatformService) NormalizeURL(value string) (string, error) {
 		trimmed = "https://" + trimmed
 	}
 	parsed, err := url.Parse(trimmed)
-	// 仅允许 http/https，且主机名必须是合法 IP 或域名，拦截明显写错的站点地址。
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || !isValidHost(parsed.Hostname()) {
+	// 生产校验器进一步收紧为公网 HTTPS；测试 seam 仍只可放宽到 HTTP/HTTPS。
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || !isValidHost(parsed.Hostname()) || s.validateURL == nil || !s.validateURL(trimmed) {
 		return "", newRequestError(ErrorInvalidURL, "")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")

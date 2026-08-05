@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// TestUpdateSub2APIAdminAccountStatus_UsesFieldOnlyBulkUpdate 验证状态更新不会读取或
-// 回写账号详情。请求体只能包含账号 ID 和目标状态，尤其不能携带倍率、凭据或分组字段。
+// TestUpdateSub2APIAdminAccountStatus_UsesFieldOnlyBulkUpdate 楠岃瘉鐘舵€佹洿鏂颁笉浼氳鍙栨垨
+// 鍥炲啓璐﹀彿璇︽儏銆傝姹備綋鍙兘鍖呭惈璐﹀彿 ID 鍜岀洰鏍囩姸鎬侊紝灏ゅ叾涓嶈兘鎼哄甫鍊嶇巼銆佸嚟鎹垨鍒嗙粍瀛楁銆?
 func TestUpdateSub2APIAdminAccountStatus_UsesFieldOnlyBulkUpdate(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -23,7 +23,7 @@ func TestUpdateSub2APIAdminAccountStatus_UsesFieldOnlyBulkUpdate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
 	if err := service.UpdateSub2APIAdminAccountStatus(session, "1515", "inactive"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -35,8 +35,8 @@ func TestUpdateSub2APIAdminAccountStatus_UsesFieldOnlyBulkUpdate(t *testing.T) {
 	}
 }
 
-// TestUpdateAdminTargetPriority_Sub2APIUsesFieldOnlyBulkUpdate 是倍率事故的核心回归测试：
-// priority 同步绝不能把 rate_multiplier 等详情字段带回上游。
+// TestUpdateAdminTargetPriority_Sub2APIUsesFieldOnlyBulkUpdate 鏄€嶇巼浜嬫晠鐨勬牳蹇冨洖褰掓祴璇曪細
+// priority 鍚屾缁濅笉鑳芥妸 rate_multiplier 绛夎鎯呭瓧娈靛甫鍥炰笂娓搞€?
 func TestUpdateAdminTargetPriority_Sub2APIUsesFieldOnlyBulkUpdate(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,7 +52,7 @@ func TestUpdateAdminTargetPriority_Sub2APIUsesFieldOnlyBulkUpdate(t *testing.T) 
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
 	if err := service.UpdateAdminTargetPriority(session, "1515", 1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -69,8 +69,8 @@ func TestUpdateAdminTargetPriority_Sub2APIUsesFieldOnlyBulkUpdate(t *testing.T) 
 	}
 }
 
-// TestSub2APIBulkAccountUpdate_UnsupportedDoesNotFallback 验证旧版接口不支持时直接失败，
-// 不再尝试危险的 GET+PUT 整对象回写。
+// TestSub2APIBulkAccountUpdate_UnsupportedDoesNotFallback 楠岃瘉鏃х増鎺ュ彛涓嶆敮鎸佹椂鐩存帴澶辫触锛?
+// 涓嶅啀灏濊瘯鍗遍櫓鐨?GET+PUT 鏁村璞″洖鍐欍€?
 func TestSub2APIBulkAccountUpdate_UnsupportedDoesNotFallback(t *testing.T) {
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -82,7 +82,7 @@ func TestSub2APIBulkAccountUpdate_UnsupportedDoesNotFallback(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
 	err := service.UpdateSub2APIAdminAccountStatus(session, "1515", "inactive")
 	if err == nil {
@@ -106,7 +106,7 @@ func TestSub2APIBulkAccountUpdate_ServerFailureIsNotMisclassifiedAsUnsupported(t
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
 	err := service.UpdateAdminTargetPriority(session, "1515", 1)
 	requestErr, ok := err.(*RequestError)
@@ -123,7 +123,7 @@ func TestSub2APIBulkAccountUpdate_RejectsNonNumericAccountID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
 	if err := service.UpdateAdminTargetPriority(session, "acc-1", 1); err == nil {
 		t.Fatal("expected a non-numeric Sub2API account ID to be rejected")
@@ -134,7 +134,7 @@ func TestSub2APIBulkAccountUpdate_RejectsNonNumericAccountID(t *testing.T) {
 }
 
 func TestUpdateSub2APIAdminAccountStatus_RejectsWrongPlatform(t *testing.T) {
-	service := NewPlatformService(NewHTTPClient(http.DefaultClient))
+	service := newTestPlatformService(http.DefaultClient)
 	session := Session{Platform: PlatformNewAPI, BaseURL: "https://example.com", AccessToken: "token-1"}
 	if err := service.UpdateSub2APIAdminAccountStatus(session, "1515", "inactive"); err == nil {
 		t.Fatal("expected error for non-Sub2API session")

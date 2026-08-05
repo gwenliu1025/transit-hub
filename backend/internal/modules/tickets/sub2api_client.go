@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
+
+	"transithub/backend/internal/security/egress"
 )
 
 // Sub2APIUser 是从 Sub2API `/api/v1/auth/me` 响应中解析出的用户身份，字段名做了常见形式兼容
@@ -34,6 +37,9 @@ type Sub2APIClient struct {
 }
 
 func NewSub2APIClient(client *http.Client) *Sub2APIClient {
+	if client == nil {
+		client = egress.NewPublicHTTPSClient(60*time.Second, nil)
+	}
 	return &Sub2APIClient{client: client}
 }
 

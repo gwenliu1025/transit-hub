@@ -21,7 +21,7 @@ func TestProbeOnce_StopsRealProbingAfterDailyBudgetExhausted(t *testing.T) {
 
 	repo := newFakeRepository()
 	sites := fakeSiteLookup{site: &upstream.Site{ID: "site-1", BaseURL: server.URL, Platform: upstream.PlatformNewAPI}}
-	svc := &Service{repo: repo, sites: sites, dispatcher: noopRemoteActionRunner{}, probeRunner: NewRealProbeRunner()}
+	svc := &Service{repo: repo, sites: sites, dispatcher: noopRemoteActionRunner{}, probeRunner: newTestRealProbeRunner()}
 
 	conn := my_sites.RealConnection{ID: "conn-1", UpstreamSiteID: "site-1", UpstreamKey: "key-1", UserID: "user1", WorkspaceAdminAccountID: "ws1"}
 	policy := Policy{ID: "policy-1", UserID: "user1", AdminAccountID: "ws1", DailyProbeBudget: 1, RecoveryStepPercent: 25, FailureThreshold: 3, SuccessThreshold: 2, CooldownSeconds: 300, ObservationSeconds: 300, AutoDegradeEnabled: true}

@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"transithub/backend/internal/security/egress"
 )
 
 // ProbeTimeout 是单次真实探活请求的超时时间，任务书要求默认 10s。
@@ -35,7 +37,12 @@ type RealProbeRunner struct {
 }
 
 func NewRealProbeRunner() *RealProbeRunner {
-	return &RealProbeRunner{client: &http.Client{Timeout: ProbeTimeout}}
+	return &RealProbeRunner{client: egress.NewPublicHTTPSClient(ProbeTimeout, nil)}
+}
+
+// NewRealProbeRunnerWithClient 允许测试显式注入本地 HTTP client；生产默认构造器保持公网 HTTPS 策略。
+func NewRealProbeRunnerWithClient(client *http.Client) *RealProbeRunner {
+	return &RealProbeRunner{client: client}
 }
 
 // Probe 发起一次真实轻量探活，返回分类后的结果。err 只用于调用方感知调用本身是否被 ctx 取消，

@@ -30,6 +30,7 @@ import (
 	"transithub/backend/internal/modules/tickets"
 	"transithub/backend/internal/modules/upstream"
 	"transithub/backend/internal/modules/users"
+	"transithub/backend/internal/security/egress"
 	"transithub/backend/internal/shared/authctx"
 	"transithub/backend/internal/shared/httpjson"
 )
@@ -82,7 +83,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 		panic(err)
 	}
 	group_rates.RegisterRoutes(server.mux, groupRatesService, adminAccountsService)
-	upstreamHTTPClient := &http.Client{Timeout: upstreamRequestTimeout}
+	upstreamHTTPClient := egress.NewPublicHTTPSClient(upstreamRequestTimeout, nil)
 	platformService := upstream.NewPlatformService(upstream.NewHTTPClient(upstreamHTTPClient))
 	upstreamCache := upstream.NewRedisSiteCache(redisClient)
 	upstreamService := upstream.NewService(platformService, upstreamRepository, groupRateSnapshotWriter{service: groupRatesService}, upstreamCache)
@@ -101,7 +102,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	if err := ticketsRepository.EnsureSchema(context.Background()); err != nil {
 		panic(err)
 	}
-	ticketsSub2APIClient := tickets.NewSub2APIClient(&http.Client{Timeout: upstreamRequestTimeout})
+	ticketsSub2APIClient := tickets.NewSub2APIClient(egress.NewPublicHTTPSClient(upstreamRequestTimeout, nil))
 	ticketsSessions := tickets.NewEmbedSessionStore(redisClient)
 	ticketsStorage, err := tickets.NewAttachmentStorage(cfg.TicketUploadDir)
 	if err != nil {
@@ -145,7 +146,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	server.lotteryFrameAncestorOrigin = lotteryService.FrameAncestorOrigin
 	lottery.RegisterRoutes(server.mux, lotteryService)
 
-	settingsService := settings.NewService(http.DefaultClient, settings.NewRepository(db))
+	settingsService := settings.NewService(egress.NewPublicHTTPSClient(upstreamRequestTimeout, nil), settings.NewRepository(db))
 	settingsService.SetAdminAccountResolver(adminAccountsService)
 	if err := settingsService.EnsureSchema(context.Background()); err != nil {
 		panic(err)

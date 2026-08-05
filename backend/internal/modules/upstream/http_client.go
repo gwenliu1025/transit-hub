@@ -6,6 +6,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
+
+	"transithub/backend/internal/security/egress"
 )
 
 const maxJSONResponseBytes int64 = 8 << 20
@@ -33,6 +36,9 @@ type jsonResponse struct {
 }
 
 func NewHTTPClient(client *http.Client) *HTTPClient {
+	if client == nil {
+		client = egress.NewPublicHTTPSClient(60*time.Second, nil)
+	}
 	return &HTTPClient{client: client}
 }
 

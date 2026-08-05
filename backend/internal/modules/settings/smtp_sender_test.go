@@ -262,12 +262,26 @@ func splitHostPort(t *testing.T, addr string) (string, int) {
 	return host, port
 }
 
+func newTestNetSMTPSender(rootCAs *x509.CertPool) *netSMTPSender {
+	return &netSMTPSender{
+		rootCAs:     rootCAs,
+		dialContext: (&net.Dialer{Timeout: smtpDialTimeout}).DialContext,
+	}
+}
+
+func TestProductionSMTPSenderRejectsLoopbackBeforeDial(t *testing.T) {
+	err := newNetSMTPSender().Send(context.Background(), testSendConfig("127.0.0.1", 1, SmtpTLSModeStarttls))
+	if err == nil || !strings.Contains(err.Error(), "出站目标必须是公网地址") {
+		t.Fatalf("生产 SMTP sender 应拒绝环回目标，得到 %v", err)
+	}
+}
+
 func TestSMTPSenderStarttlsSendsDataSuccessfully(t *testing.T) {
 	cert, pool := generateTestCertificate(t)
 	addr, capture := runFakeSMTPServer(t, cert, false, fakeSMTPServerBehavior{})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	if err := sender.Send(context.Background(), cfg); err != nil {
 		t.Fatalf("expected successful send, got %v", err)
@@ -288,7 +302,7 @@ func TestSMTPSenderImplicitTLSSendsDataSuccessfully(t *testing.T) {
 	addr, capture := runFakeSMTPServer(t, cert, true, fakeSMTPServerBehavior{expectImplicitTLS: true})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeImplicit)
 	if err := sender.Send(context.Background(), cfg); err != nil {
 		t.Fatalf("expected successful send, got %v", err)
@@ -306,7 +320,7 @@ func TestSMTPSenderAuthenticationSuccess(t *testing.T) {
 	addr, capture := runFakeSMTPServer(t, cert, false, fakeSMTPServerBehavior{requireAuth: true})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	cfg.Username = "mailer@example.com"
 	cfg.Password = "correct-password"
@@ -328,7 +342,7 @@ func TestSMTPSenderAuthPlainPreservesPasswordLeadingAndTrailingSpaces(t *testing
 	addr, capture := runFakeSMTPServer(t, cert, false, fakeSMTPServerBehavior{requireAuth: true})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	cfg.Username = "mailer@example.com"
 	cfg.Password = "  secret with spaces  "
@@ -358,7 +372,7 @@ func TestSMTPSenderSkipsAuthWhenUsernameEmpty(t *testing.T) {
 	addr, capture := runFakeSMTPServer(t, cert, false, fakeSMTPServerBehavior{})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	cfg.Username = ""
 	cfg.Password = ""
@@ -379,7 +393,7 @@ func TestSMTPSenderSkipsAuthWhenUsernameEmpty(t *testing.T) {
 }
 
 func TestSMTPSenderRejectsPasswordWithoutUsernameBeforeDial(t *testing.T) {
-	sender := &netSMTPSender{}
+	sender := newTestNetSMTPSender(nil)
 	cfg := testSendConfig("127.0.0.1", 1, SmtpTLSModeStarttls)
 	cfg.Username = ""
 	cfg.Password = "legacy-password"
@@ -395,7 +409,7 @@ func TestSMTPSenderUsesBareEnvelopeAddresses(t *testing.T) {
 	addr, capture := runFakeSMTPServer(t, cert, false, fakeSMTPServerBehavior{})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	if err := sender.Send(context.Background(), cfg); err != nil {
 		t.Fatalf("expected successful send, got %v", err)
@@ -424,7 +438,7 @@ func TestSMTPSenderAuthenticationFailureMapsToSendFailed(t *testing.T) {
 	addr, _ := runFakeSMTPServer(t, cert, false, fakeSMTPServerBehavior{rejectAuth: true})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	cfg.Username = "mailer@example.com"
 	cfg.Password = "wrong-password"
@@ -442,7 +456,7 @@ func TestSMTPSenderRcptRejectionMapsToSendFailed(t *testing.T) {
 	addr, _ := runFakeSMTPServer(t, cert, false, fakeSMTPServerBehavior{rejectRcpt: true})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	err := sender.Send(context.Background(), cfg)
 	if err == nil {
@@ -458,7 +472,7 @@ func TestSMTPSenderRejectsCRLFInHeaderValues(t *testing.T) {
 	addr, _ := runFakeSMTPServer(t, cert, false, fakeSMTPServerBehavior{})
 	host, port := splitHostPort(t, addr)
 
-	sender := &netSMTPSender{rootCAs: pool}
+	sender := newTestNetSMTPSender(pool)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	cfg.FromName = "Evil\r\nBcc: attacker@example.com"
 	if err := sender.Send(context.Background(), cfg); err != ErrSMTPValidation {
@@ -474,7 +488,7 @@ func TestSMTPSenderDoesNotSkipCertificateVerification(t *testing.T) {
 	host, port := splitHostPort(t, addr)
 
 	// 故意不注入正确的 CA 池：系统根证书不会信任这张自签名测试证书，STARTTLS 应当失败。
-	sender := &netSMTPSender{}
+	sender := newTestNetSMTPSender(nil)
 	cfg := testSendConfig(host, port, SmtpTLSModeStarttls)
 	err := sender.Send(context.Background(), cfg)
 	if err == nil {

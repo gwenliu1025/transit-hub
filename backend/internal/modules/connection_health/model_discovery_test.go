@@ -13,7 +13,7 @@ import (
 // 额外补上 modelDiscovery 依赖（newAdminGroupsService 不初始化它，DiscoverTargetModels 需要）。
 func newModelDiscoveryTestService(reader PlatformGroupReader, mySites MySitesReader, repo *fakeRepository) *Service {
 	svc := newAdminGroupsService(reader, mySites, repo)
-	svc.modelDiscovery = NewModelDiscoveryRunner()
+	svc.modelDiscovery = newTestModelDiscoveryRunner()
 	return svc
 }
 
@@ -32,7 +32,7 @@ func TestListModels_ParsesOpenAICompatibleResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewModelDiscoveryRunner()
+	runner := newTestModelDiscoveryRunner()
 	models, err := runner.ListModels(context.Background(), server.URL, "secret-key")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -55,7 +55,7 @@ func TestListModels_UpstreamErrorStatusReturnsUnavailable(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(status)
 		}))
-		runner := NewModelDiscoveryRunner()
+		runner := newTestModelDiscoveryRunner()
 		_, err := runner.ListModels(context.Background(), server.URL, "k")
 		server.Close()
 		if err == nil || err.Error() != ErrorModelListUnavailable {
@@ -73,7 +73,7 @@ func TestListModels_InvalidBodyReturnsInvalid(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewModelDiscoveryRunner()
+	runner := newTestModelDiscoveryRunner()
 	_, err := runner.ListModels(context.Background(), server.URL, "k")
 	if err == nil || err.Error() != ErrorModelListInvalid {
 		t.Fatalf("expected ErrorModelListInvalid, got %v", err)
@@ -88,7 +88,7 @@ func TestListModels_EmptyDataReturnsEmptySlice(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewModelDiscoveryRunner()
+	runner := newTestModelDiscoveryRunner()
 	models, err := runner.ListModels(context.Background(), server.URL, "k")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

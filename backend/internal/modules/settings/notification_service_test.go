@@ -10,6 +10,21 @@ import (
 	"testing"
 )
 
+func TestNewServiceDefaultsToSafeHTTPClient(t *testing.T) {
+	service := NewService(nil, nil)
+	err := service.postJSON(context.Background(), "http://127.0.0.1:1/hook", map[string]string{"text": "test"})
+	if err == nil || !errors.Is(err, ErrSendNotificationFailed) {
+		t.Fatalf("默认通知客户端应拒绝环回 HTTP，得到 %v", err)
+	}
+}
+
+func TestTelegramClientRejectsUnsafeProxy(t *testing.T) {
+	service := NewService(http.DefaultClient, nil)
+	if client := service.telegramClient("socks5://127.0.0.1:1080"); client != nil {
+		t.Fatal("Telegram 环回代理应被拒绝")
+	}
+}
+
 func TestWecomNotificationReusesTextWebhookWithoutSigning(t *testing.T) {
 	type webhookPayload struct {
 		MessageType string `json:"msgtype"`

@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// TestFetchAdminGroupDailyStats_DispatchesByPlatform 验证平台中性包装方法按
-// session.Platform 正确路由到 sub2api / new-api 具体实现，不重复实现底层抓取逻辑。
+// TestFetchAdminGroupDailyStats_DispatchesByPlatform 楠岃瘉骞冲彴涓€у寘瑁呮柟娉曟寜
+// session.Platform 姝ｇ‘璺敱鍒?sub2api / new-api 鍏蜂綋瀹炵幇锛屼笉閲嶅瀹炵幇搴曞眰鎶撳彇閫昏緫銆?
 func TestFetchAdminGroupDailyStats_DispatchesByPlatform(t *testing.T) {
 	t.Run("sub2api uses usage-summary endpoint", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -29,7 +29,7 @@ func TestFetchAdminGroupDailyStats_DispatchesByPlatform(t *testing.T) {
 		}))
 		defer server.Close()
 
-		service := NewPlatformService(NewHTTPClient(server.Client()))
+		service := newTestPlatformService(server.Client())
 		session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token"}
 
 		stats, err := service.FetchAdminGroupDailyStats(session, nil)
@@ -62,7 +62,7 @@ func TestFetchAdminGroupDailyStats_DispatchesByPlatform(t *testing.T) {
 		}))
 		defer server.Close()
 
-		service := NewPlatformService(NewHTTPClient(server.Client()))
+		service := newTestPlatformService(server.Client())
 		session := Session{Platform: PlatformNewAPI, BaseURL: server.URL, Cookie: "session=abc", UserID: "1", QuotaPerUnit: 100000}
 		groups := []GroupInfo{{Name: "default"}, {Name: "vip"}}
 
@@ -87,8 +87,8 @@ func TestFetchAdminGroupDailyStats_DispatchesByPlatform(t *testing.T) {
 	})
 }
 
-// TestSub2APICostParsers 验证 sub2api 各降级路径的字段解析覆盖文档要求的
-// today_actual_cost / total_actual_cost / actual_cost 语义。
+// TestSub2APICostParsers 楠岃瘉 sub2api 鍚勯檷绾ц矾寰勭殑瀛楁瑙ｆ瀽瑕嗙洊鏂囨。瑕佹眰鐨?
+// today_actual_cost / total_actual_cost / actual_cost 璇箟銆?
 func TestSub2APICostParsers(t *testing.T) {
 	t.Run("group usage summary prefers today_actual_cost", func(t *testing.T) {
 		got := sub2APIUsageSummaryCost(map[string]any{"today_actual_cost": 9.5})

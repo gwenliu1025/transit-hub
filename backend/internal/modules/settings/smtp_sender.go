@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"transithub/backend/internal/security/egress"
 )
 
 const (
@@ -45,7 +47,8 @@ type smtpSender interface {
 // rootCAs 仅供包内测试注入自签根证书池；生产构造路径 newNetSMTPSender 保持为 nil，
 // 即使用系统根证书，不允许跳过证书校验（InsecureSkipVerify 恒为 false）。
 type netSMTPSender struct {
-	rootCAs *x509.CertPool
+	rootCAs     *x509.CertPool
+	dialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 // newNetSMTPSender 是生产环境使用的构造函数：不接受自定义根证书池。
@@ -84,23 +87,30 @@ func (s *netSMTPSender) Send(ctx context.Context, cfg smtpSendConfig) error {
 	}
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	dialer := &net.Dialer{Timeout: smtpDialTimeout}
-
-	var conn net.Conn
-	var err error
-	if cfg.TLSMode == SmtpTLSModeImplicit {
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	dialContext := s.dialContext
+	if dialContext == nil {
+		dialContext = egress.NewPublicNetworkDialer(smtpDialTimeout, nil).DialContext
 	}
+
+	conn, err := dialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("%w: dial: %v", ErrSMTPSendFailed, err)
 	}
-	defer conn.Close()
-	// 连接级 deadline 覆盖 TLS 握手、SMTP 命令和整体发送，Go 标准库 net/smtp 没有原生 context 支持。
+	// 在隐式 TLS 握手前就设置整体 deadline；否则 TLS 握手可能绕过 smtpOverallTimeout。
 	if err := conn.SetDeadline(deadline); err != nil {
+		_ = conn.Close()
 		return fmt.Errorf("%w: set deadline: %v", ErrSMTPSendFailed, err)
 	}
+	if cfg.TLSMode == SmtpTLSModeImplicit {
+		tlsConn := tls.Client(conn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("%w: TLS handshake: %v", ErrSMTPSendFailed, err)
+		}
+		conn = tlsConn
+	}
+	defer conn.Close()
+	// 连接级 deadline 覆盖 TLS 握手、SMTP 命令和整体发送，Go 标准库 net/smtp 没有原生 context 支持。
 
 	client, err := smtp.NewClient(conn, cfg.Host)
 	if err != nil {

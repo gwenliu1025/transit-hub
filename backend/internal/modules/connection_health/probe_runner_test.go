@@ -36,7 +36,7 @@ func TestProbe_AllProviderFamiliesUseOpenAICompatibleGatewayEndpoint(t *testing.
 			}))
 			defer server.Close()
 
-			runner := NewRealProbeRunner()
+			runner := newTestRealProbeRunner()
 			outcome := runner.Probe(context.Background(), ProbeRequest{
 				BaseURL: server.URL, UpstreamKey: "gateway-key", ProviderFamily: family, MaxTokens: 1,
 			})
@@ -74,7 +74,7 @@ func TestProbe_DefaultModelPerProviderWhenModelNameEmpty(t *testing.T) {
 			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
 		}))
 
-		runner := NewRealProbeRunner()
+		runner := newTestRealProbeRunner()
 		runner.Probe(context.Background(), ProbeRequest{BaseURL: server.URL, UpstreamKey: "k", ProviderFamily: family})
 		server.Close()
 
@@ -91,7 +91,7 @@ func TestProbe_RateLimited(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewRealProbeRunner()
+	runner := newTestRealProbeRunner()
 	outcome := runner.Probe(context.Background(), ProbeRequest{
 		BaseURL: server.URL, UpstreamKey: "secret-key", ProviderFamily: ProviderAnthropic,
 	})
@@ -107,7 +107,7 @@ func TestProbe_ServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewRealProbeRunner()
+	runner := newTestRealProbeRunner()
 	outcome := runner.Probe(context.Background(), ProbeRequest{
 		BaseURL: server.URL, UpstreamKey: "secret-key", ProviderFamily: ProviderOpenAI,
 	})
@@ -122,7 +122,7 @@ func TestProbe_AuthFailure(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewRealProbeRunner()
+	runner := newTestRealProbeRunner()
 	outcome := runner.Probe(context.Background(), ProbeRequest{
 		BaseURL: server.URL, UpstreamKey: "secret-key", ProviderFamily: ProviderOpenAI,
 	})
@@ -137,7 +137,7 @@ func TestProbe_ModelNotFound(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewRealProbeRunner()
+	runner := newTestRealProbeRunner()
 	outcome := runner.Probe(context.Background(), ProbeRequest{
 		BaseURL: server.URL, UpstreamKey: "secret-key", ProviderFamily: ProviderGemini, ModelName: "does-not-exist",
 	})
@@ -153,7 +153,7 @@ func TestProbe_InvalidResponseBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewRealProbeRunner()
+	runner := newTestRealProbeRunner()
 	outcome := runner.Probe(context.Background(), ProbeRequest{
 		BaseURL: server.URL, UpstreamKey: "secret-key", ProviderFamily: ProviderOpenAI,
 	})
@@ -186,7 +186,7 @@ func TestProbe_KeyNeverLeaksIntoDetail(t *testing.T) {
 	}))
 	defer server.Close()
 
-	runner := NewRealProbeRunner()
+	runner := newTestRealProbeRunner()
 	outcome := runner.Probe(context.Background(), ProbeRequest{
 		BaseURL: server.URL, UpstreamKey: secret, ProviderFamily: ProviderAnthropic,
 	})

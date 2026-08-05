@@ -45,7 +45,7 @@ func newAdminGroupsService(reader PlatformGroupReader, mySites MySitesReader, re
 		mySites:        mySites,
 		accounts:       fakeAdminAccountResolver{id: "ws1"},
 		dispatcher:     noopRemoteActionRunner{},
-		probeRunner:    NewRealProbeRunner(),
+		probeRunner:    newTestRealProbeRunner(),
 		platformGroups: reader,
 	}
 }

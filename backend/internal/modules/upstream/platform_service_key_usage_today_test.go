@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// TestFetchKeyUsageToday_Sub2API_PaginatesKeysAndFiltersZeroCost 覆盖测试要求 5：
-// sub2api key 列表必须分页拉取完整（不能只取第一页），且只保留今日消费 > 0 的 key。
+// TestFetchKeyUsageToday_Sub2API_PaginatesKeysAndFiltersZeroCost 瑕嗙洊娴嬭瘯瑕佹眰 5锛?
+// sub2api key 鍒楄〃蹇呴』鍒嗛〉鎷夊彇瀹屾暣锛堜笉鑳藉彧鍙栫涓€椤碉級锛屼笖鍙繚鐣欎粖鏃ユ秷璐?> 0 鐨?key銆?
 func TestFetchKeyUsageToday_Sub2API_PaginatesKeysAndFiltersZeroCost(t *testing.T) {
-	const totalKeys = 150 // 超过单页 100 条，强制触发第 2 页请求
+	const totalKeys = 150 // 瓒呰繃鍗曢〉 100 鏉★紝寮哄埗瑙﹀彂绗?2 椤佃姹?
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/keys":
@@ -52,7 +52,7 @@ func TestFetchKeyUsageToday_Sub2API_PaginatesKeysAndFiltersZeroCost(t *testing.T
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token"}
 
 	stats, err := service.FetchKeyUsageToday(session, nil)
@@ -73,16 +73,16 @@ func TestFetchKeyUsageToday_Sub2API_PaginatesKeysAndFiltersZeroCost(t *testing.T
 		t.Errorf("key 1 cost = %.2f, want 12.50", byID["1"])
 	}
 	if byID["150"] != 3.25 {
-		t.Errorf("key 150 (only reachable via page 2) cost = %.2f, want 3.25 — pagination may have stopped at page 1", byID["150"])
+		t.Errorf("key 150 (only reachable via page 2) cost = %.2f, want 3.25 鈥?pagination may have stopped at page 1", byID["150"])
 	}
 }
 
-// TestFetchKeyUsageToday_Sub2API_UsesShanghaiDate 验证 Sub2API 的逐 key 今日统计
-// 不受进程本地时区影响，日期和 timezone 参数始终按北京时间生成。
+// TestFetchKeyUsageToday_Sub2API_UsesShanghaiDate 楠岃瘉 Sub2API 鐨勯€?key 浠婃棩缁熻
+// 涓嶅彈杩涚▼鏈湴鏃跺尯褰卞搷锛屾棩鏈熷拰 timezone 鍙傛暟濮嬬粓鎸夊寳浜椂闂寸敓鎴愩€?
 func TestFetchKeyUsageToday_Sub2API_UsesShanghaiDate(t *testing.T) {
 	shanghai, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
-		t.Fatalf("加载北京时间时区失败: %v", err)
+		t.Fatalf("鍔犺浇鍖椾含鏃堕棿鏃跺尯澶辫触: %v", err)
 	}
 	now := time.Now()
 	wantDate := now.In(shanghai).Format("2006-01-02")
@@ -119,7 +119,7 @@ func TestFetchKeyUsageToday_Sub2API_UsesShanghaiDate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	stats, err := service.FetchKeyUsageToday(Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token"}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -129,9 +129,9 @@ func TestFetchKeyUsageToday_Sub2API_UsesShanghaiDate(t *testing.T) {
 	}
 }
 
-// TestFetchKeyUsageToday_NewAPI_UsesTokenNameAndGroupFilter 覆盖测试要求 6：
-// new-api token 列表分页 + token_name/group 统计路径：带分组的 token 按 token_name+group 查询，
-// 无分组的 token 只按 token_name 查询（不做全分组穷举）。
+// TestFetchKeyUsageToday_NewAPI_UsesTokenNameAndGroupFilter 瑕嗙洊娴嬭瘯瑕佹眰 6锛?
+// new-api token 鍒楄〃鍒嗛〉 + token_name/group 缁熻璺緞锛氬甫鍒嗙粍鐨?token 鎸?token_name+group 鏌ヨ锛?
+// 鏃犲垎缁勭殑 token 鍙寜 token_name 鏌ヨ锛堜笉鍋氬叏鍒嗙粍绌蜂妇锛夈€?
 func TestFetchKeyUsageToday_NewAPI_UsesTokenNameAndGroupFilter(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -170,7 +170,7 @@ func TestFetchKeyUsageToday_NewAPI_UsesTokenNameAndGroupFilter(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewPlatformService(NewHTTPClient(server.Client()))
+	service := newTestPlatformService(server.Client())
 	session := Session{Platform: PlatformNewAPI, BaseURL: server.URL, Cookie: "session=abc", UserID: "1", QuotaPerUnit: 100000}
 
 	stats, err := service.FetchKeyUsageToday(session, nil)
@@ -188,9 +188,9 @@ func TestFetchKeyUsageToday_NewAPI_UsesTokenNameAndGroupFilter(t *testing.T) {
 	}
 }
 
-// TestFetchKeyUsageToday_UnsupportedPlatform 验证未知平台会话直接返回错误，而不是静默返回空结果。
+// TestFetchKeyUsageToday_UnsupportedPlatform 楠岃瘉鏈煡骞冲彴浼氳瘽鐩存帴杩斿洖閿欒锛岃€屼笉鏄潤榛樿繑鍥炵┖缁撴灉銆?
 func TestFetchKeyUsageToday_UnsupportedPlatform(t *testing.T) {
-	service := NewPlatformService(NewHTTPClient(http.DefaultClient))
+	service := newTestPlatformService(http.DefaultClient)
 	_, err := service.FetchKeyUsageToday(Session{Platform: PlatformAuto}, nil)
 	if err == nil {
 		t.Fatal("expected error for unsupported platform, got nil")

@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"transithub/backend/internal/security/egress"
 )
 
 const testMessage = "Transit Hub notification channel test succeeded."
@@ -72,7 +74,7 @@ type AdminAccountResolver interface {
 
 func NewService(client *http.Client, repository *Repository) *Service {
 	if client == nil {
-		client = http.DefaultClient
+		client = egress.NewPublicHTTPSClient(30*time.Second, nil)
 	}
 	return &Service{
 		client:            client,
@@ -536,6 +538,9 @@ func (s *Service) postJSON(ctx context.Context, endpoint string, payload any) er
 }
 
 func (s *Service) postJSONWithClient(ctx context.Context, client *http.Client, endpoint string, payload any) error {
+	if client == nil {
+		return ErrSendNotificationFailed
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -562,13 +567,11 @@ func (s *Service) telegramClient(proxyURL string) *http.Client {
 	if proxyURL == "" {
 		return s.client
 	}
-	parsedProxy, err := url.Parse(proxyURL)
+	parsedProxy, err := egress.ValidatePublicProxyURL(context.Background(), proxyURL, nil)
 	if err != nil {
-		return s.client
+		return nil
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = http.ProxyURL(parsedProxy)
-	return &http.Client{Transport: transport, Timeout: s.client.Timeout}
+	return egress.NewPublicHTTPSClientWithProxy(s.client.Timeout, nil, parsedProxy)
 }
 
 func dingtalkSignedWebhook(webhook string, secret string) (string, error) {
