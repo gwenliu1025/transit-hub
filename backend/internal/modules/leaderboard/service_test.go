@@ -176,7 +176,7 @@ func TestNormalizeQueryRejectsInvalidDateRange(t *testing.T) {
 }
 
 func TestNormalizeSrcHostRejectsLocalhostAndReservedIP(t *testing.T) {
-	for _, value := range []string{"localhost", "http://localhost", "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.1.1", "0.0.0.0"} {
+	for _, value := range []string{"localhost", "http://localhost", "http://src.example.com", "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.1.1", "0.0.0.0"} {
 		if _, err := normalizeSrcHost(value); err == nil {
 			t.Fatalf("expected %q to be rejected", value)
 		}
