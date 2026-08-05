@@ -243,11 +243,13 @@ func (f *fakeSessionStore) DeleteWorkspace(_ context.Context, userID string, adm
 
 // fakeSub2API 是 sub2APIFetcher 的假实现，按测试用例预设固定返回值/错误。
 type fakeSub2API struct {
-	user Sub2APIUser
-	err  error
+	user  Sub2APIUser
+	err   error
+	calls int
 }
 
 func (f *fakeSub2API) FetchCurrentUser(srcHost string, token string) (Sub2APIUser, error) {
+	f.calls++
 	return f.user, f.err
 }
 
@@ -335,9 +337,13 @@ func newTestService(repo *fakeTicketRepository, sessions *fakeSessionStore, sub2
 		sub2api:    sub2api,
 		storage:    newFakeAttachmentStorage(),
 		accounts:   accounts,
-		newID:      sequentialIDs("id"),
-		newToken:   sequentialIDs("token"),
-		now:        time.Now,
+		adminSessions: &fakeAdminSessionProvider{session: upstream.Session{
+			Platform: upstream.PlatformSub2API,
+			BaseURL:  "https://web.example.com",
+		}},
+		newID:    sequentialIDs("id"),
+		newToken: sequentialIDs("token"),
+		now:      time.Now,
 	}
 }
 
@@ -377,6 +383,112 @@ func TestCreateEmbedSession_Success(t *testing.T) {
 	}
 	if session.UserID != "user1" || session.AdminAccountID != "account1" || session.Sub2apiUserID != "42" {
 		t.Fatalf("unexpected session contents: %+v", session)
+	}
+}
+
+func TestCreateEmbedSession_NormalizesPublicHTTPSCurrentAdminSource(t *testing.T) {
+	repo := newFakeTicketRepository()
+	seedEmbedConfig(repo, "user1", "account1", "embed-token", true, "")
+	svc := newTestService(repo, newFakeSessionStore(), &fakeSub2API{user: Sub2APIUser{ID: "42"}}, nil)
+	svc.adminSessions = &fakeAdminSessionProvider{session: upstream.Session{
+		Platform: upstream.PlatformSub2API,
+		BaseURL:  "https://real.example.com/admin?source=current",
+	}}
+
+	resp, err := svc.CreateEmbedSession(context.Background(), CreateSessionRequest{
+		EmbedToken:   "embed-token",
+		Sub2apiToken: "sub2api-jwt",
+		SrcHost:      "https://real.example.com/embed/tickets",
+	})
+	if err != nil {
+		t.Fatalf("expected normalized public HTTPS source to remain valid, got %v", err)
+	}
+	session, err := svc.sessions.Get(context.Background(), resp.SessionToken)
+	if err != nil || session == nil {
+		t.Fatalf("expected persisted session, got session=%+v err=%v", session, err)
+	}
+	if session.SrcHost != "https://real.example.com" {
+		t.Fatalf("expected normalized source origin, got %q", session.SrcHost)
+	}
+}
+
+func TestCreateEmbedSession_RejectsSrcHostNotBoundToCurrentAdminSession(t *testing.T) {
+	repo := newFakeTicketRepository()
+	seedEmbedConfig(repo, "user1", "account1", "embed-token", true, "")
+	sub2api := &fakeSub2API{user: Sub2APIUser{ID: "42"}}
+	svc := newTestService(repo, newFakeSessionStore(), sub2api, nil)
+	svc.adminSessions = &fakeAdminSessionProvider{session: upstream.Session{Platform: upstream.PlatformSub2API, BaseURL: "https://real.example.com"}}
+
+	_, err := svc.CreateEmbedSession(context.Background(), CreateSessionRequest{
+		EmbedToken:   "embed-token",
+		Sub2apiToken: "sub2api-jwt",
+		SrcHost:      "https://fake.example.com",
+	})
+	if !errors.Is(err, requestError(ErrorEmbedSrcHostMismatch)) {
+		t.Fatalf("expected source binding rejection, got %v", err)
+	}
+	if sub2api.calls != 0 {
+		t.Fatalf("expected fake source to be rejected before outbound identity lookup, got %d calls", sub2api.calls)
+	}
+}
+
+func TestCreateEmbedSession_RejectsMissingCurrentAdminSession(t *testing.T) {
+	repo := newFakeTicketRepository()
+	seedEmbedConfig(repo, "user1", "account1", "embed-token", true, "")
+	svc := newTestService(repo, newFakeSessionStore(), &fakeSub2API{user: Sub2APIUser{ID: "42"}}, nil)
+	svc.adminSessions = &fakeAdminSessionProvider{err: errors.New("admin session missing")}
+
+	_, err := svc.CreateEmbedSession(context.Background(), CreateSessionRequest{
+		EmbedToken:   "embed-token",
+		Sub2apiToken: "sub2api-jwt",
+		SrcHost:      "https://real.example.com",
+	})
+	if !errors.Is(err, requestError(ErrorEmbedSessionInvalid)) {
+		t.Fatalf("expected missing admin session rejection, got %v", err)
+	}
+}
+
+func TestEmbedSessionUse_RejectsPersistedWorkspaceBindingMismatch(t *testing.T) {
+	repo := newFakeTicketRepository()
+	repo.configsByWorkspace[workspaceKey("user1", "account1")] = &EmbedConfig{
+		UserID: "user2", AdminAccountID: "account2", EmbedToken: "embed-token",
+	}
+	sessions := newFakeSessionStore()
+	sessions.sessions["session-1"] = EmbedSession{
+		UserID: "user1", AdminAccountID: "account1", SrcHost: "https://real.example.com", Sub2apiUserID: "42",
+	}
+	svc := newTestService(repo, sessions, &fakeSub2API{}, nil)
+	svc.adminSessions = &fakeAdminSessionProvider{session: upstream.Session{Platform: upstream.PlatformSub2API, BaseURL: "https://real.example.com"}}
+
+	_, err := svc.ListMyTickets(context.Background(), "session-1")
+	if !errors.Is(err, requestError(ErrorEmbedSessionInvalid)) {
+		t.Fatalf("expected persisted workspace binding rejection, got %v", err)
+	}
+}
+
+func TestEmbedSessionUse_RejectsCurrentAdminSourceChangeOrMissingSession(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		provider *fakeAdminSessionProvider
+	}{
+		{name: "source changed", provider: &fakeAdminSessionProvider{session: upstream.Session{Platform: upstream.PlatformSub2API, BaseURL: "https://new.example.com"}}},
+		{name: "session missing", provider: &fakeAdminSessionProvider{err: errors.New("admin session missing")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeTicketRepository()
+			seedEmbedConfig(repo, "user1", "account1", "embed-token", true, "")
+			sessions := newFakeSessionStore()
+			sessions.sessions["session-1"] = EmbedSession{
+				UserID: "user1", AdminAccountID: "account1", SrcHost: "https://real.example.com", Sub2apiUserID: "42",
+			}
+			svc := newTestService(repo, sessions, &fakeSub2API{}, nil)
+			svc.adminSessions = tc.provider
+
+			_, err := svc.ListMyTickets(context.Background(), "session-1")
+			if !errors.Is(err, requestError(ErrorEmbedSessionInvalid)) {
+				t.Fatalf("expected current source binding rejection, got %v", err)
+			}
+		})
 	}
 }
 
@@ -451,7 +563,7 @@ func TestCreateEmbedSession_ConfigNotFound(t *testing.T) {
 }
 
 // TestCreateEmbedSession_LegacyAllowedSrcHostIgnored 校验第二阶段取消"允许来源域名"配置后，
-// 历史上限制过来源域名的旧数据不会继续拒绝来自其它域名的会话请求。
+// 历史上限制过来源域名的旧数据不会继续覆盖当前 workspace 上游来源绑定。
 func TestCreateEmbedSession_LegacyAllowedSrcHostIgnored(t *testing.T) {
 	repo := newFakeTicketRepository()
 	seedEmbedConfig(repo, "user1", "account1", "embed-token", true, "https://allowed.example.com")
@@ -460,7 +572,7 @@ func TestCreateEmbedSession_LegacyAllowedSrcHostIgnored(t *testing.T) {
 	resp, err := svc.CreateEmbedSession(context.Background(), CreateSessionRequest{
 		EmbedToken:   "embed-token",
 		Sub2apiToken: "sub2api-jwt",
-		SrcHost:      "https://other.example.com",
+		SrcHost:      "https://web.example.com",
 	})
 	if err != nil {
 		t.Fatalf("expected legacy allowedSrcHost to no longer restrict src_host, got error: %v", err)
@@ -522,6 +634,7 @@ func TestCreateEmbedSession_IncludesWorkspaceTemplate(t *testing.T) {
 
 func establishedSession(svc *Service, t *testing.T) string {
 	t.Helper()
+	seedEmbedConfig(svc.repository.(*fakeTicketRepository), "user1", "account1", "embed-token", true, "")
 	sessionToken := "session-1"
 	svc.sessions.(*fakeSessionStore).sessions[sessionToken] = EmbedSession{
 		UserID: "user1", AdminAccountID: "account1", SrcHost: "https://web.example.com", Sub2apiUserID: "42", Sub2apiEmail: "sub2api@example.com",
@@ -765,7 +878,7 @@ func TestUpdateEmbedConfig_LegacyEnabledFalseDoesNotDisable(t *testing.T) {
 }
 
 // TestUpdateEmbedConfig_LegacyAllowedSrcHostRequestIgnored 校验旧前端仍然传 allowedSrcHost 时
-// 不会继续限制 iframe 来源（保存后 CreateEmbedSession 必须仍然对任意来源成功）。
+// 不会继续使用旧白名单限制 iframe 来源（但仍必须匹配当前 workspace 上游）。
 func TestUpdateEmbedConfig_LegacyAllowedSrcHostRequestIgnored(t *testing.T) {
 	repo := newFakeTicketRepository()
 	svc := newTestService(repo, newFakeSessionStore(), &fakeSub2API{user: Sub2APIUser{ID: "42"}}, &fakeAccountResolver{id: "account1"})
@@ -785,10 +898,10 @@ func TestUpdateEmbedConfig_LegacyAllowedSrcHostRequestIgnored(t *testing.T) {
 	resp, err := svc.CreateEmbedSession(context.Background(), CreateSessionRequest{
 		EmbedToken:   config.EmbedToken,
 		Sub2apiToken: "sub2api-jwt",
-		SrcHost:      "https://some-other-host.example.com",
+		SrcHost:      "https://web.example.com",
 	})
 	if err != nil {
-		t.Fatalf("expected session creation from an unlisted host to succeed, got error: %v", err)
+		t.Fatalf("expected session creation from current upstream host to succeed, got error: %v", err)
 	}
 	if resp.SessionToken == "" {
 		t.Fatalf("expected non-empty session token")

@@ -158,6 +158,9 @@ func (s *Service) CreateEmbedSession(ctx context.Context, req CreateSessionReque
 	if err != nil {
 		return CreateSessionResponse{}, err
 	}
+	if err := s.validateCurrentSourceBinding(ctx, config.UserID, config.AdminAccountID, normalizedSrcHost); err != nil {
+		return CreateSessionResponse{}, err
+	}
 
 	user, err := s.sub2api.FetchCurrentUser(normalizedSrcHost, sub2apiToken)
 	if err != nil {
@@ -220,16 +223,46 @@ func (s *Service) requireSession(ctx context.Context, sessionToken string) (*Emb
 	if session == nil {
 		return nil, requestError(ErrorEmbedSessionInvalid)
 	}
+	var config *EmbedConfig
 	if strings.TrimSpace(session.EmbedToken) != "" {
-		config, err := s.repository.GetEmbedConfigByToken(ctx, session.EmbedToken)
-		if err != nil {
-			return nil, err
-		}
-		if config == nil || config.UserID != session.UserID || config.AdminAccountID != session.AdminAccountID {
-			return nil, requestError(ErrorEmbedSessionInvalid)
-		}
+		config, err = s.repository.GetEmbedConfigByToken(ctx, strings.TrimSpace(session.EmbedToken))
+	} else {
+		config, err = s.repository.GetEmbedConfigByWorkspace(ctx, session.UserID, session.AdminAccountID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if config == nil || config.UserID != session.UserID || config.AdminAccountID != session.AdminAccountID {
+		return nil, requestError(ErrorEmbedSessionInvalid)
+	}
+	if err := s.validateCurrentSourceBinding(ctx, session.UserID, session.AdminAccountID, session.SrcHost); err != nil {
+		return nil, requestError(ErrorEmbedSessionInvalid)
 	}
 	return session, nil
+}
+
+// validateCurrentSourceBinding 将客户端/会话中持久化的来源绑定到当前 workspace
+// 的真实 admin 会话。任何 admin 会话缺失、非 Sub2API、BaseURL 无效或来源变化都拒绝。
+func (s *Service) validateCurrentSourceBinding(ctx context.Context, userID, adminAccountID, sourceHost string) error {
+	if s.adminSessions == nil {
+		return requestError(ErrorEmbedSessionInvalid)
+	}
+	normalizedSource, err := normalizeSrcHost(sourceHost)
+	if err != nil {
+		return requestError(ErrorEmbedSrcHostMismatch)
+	}
+	adminSession, err := s.adminSessions.RequireSession(ctx, userID, adminAccountID)
+	if err != nil {
+		return requestError(ErrorEmbedSessionInvalid)
+	}
+	adminOrigin, err := normalizeSrcHost(adminSession.BaseURL)
+	if err != nil || adminSession.Platform != upstream.PlatformSub2API {
+		return requestError(ErrorEmbedSrcHostMismatch)
+	}
+	if adminOrigin != normalizedSource {
+		return requestError(ErrorEmbedSrcHostMismatch)
+	}
+	return nil
 }
 
 func (s *Service) ListMyTickets(ctx context.Context, sessionToken string) (EmbedTicketListResponse, error) {
