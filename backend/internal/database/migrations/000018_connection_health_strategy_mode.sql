@@ -2,6 +2,12 @@
 ALTER TABLE IF EXISTS connection_health_policies
     ADD COLUMN IF NOT EXISTS strategy_mode text NOT NULL DEFAULT 'health_probe';
 
+-- v0.1.7 等旧实例可能由运行时 EnsureSchema 预先创建策略表，但当时还没有
+-- priority_mode。迁移必须在兼容回填前自行补齐依赖列，不能等待迁移结束后
+-- 才运行的 EnsureSchema。
+ALTER TABLE IF EXISTS connection_health_policies
+    ADD COLUMN IF NOT EXISTS priority_mode text NOT NULL DEFAULT 'none';
+
 -- Runtime EnsureSchema historically creates these tables after migrations run. Guard the
 -- compatibility backfill so a fresh database can complete migrations before those tables exist.
 -- Existing installations have both tables and still receive the rolling-deployment backfill.
