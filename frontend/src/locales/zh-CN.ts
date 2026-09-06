@@ -420,8 +420,8 @@ export default {
       },
       period: {
         label: '统计周期',
-        week: '周',
-        month: '月'
+        week: '本周',
+        month: '本月'
       },
       delta: {
         vsPrev: '较前一日',
@@ -432,7 +432,7 @@ export default {
       },
       performance: {
         title: '经营表现',
-        subtitle: '营收、成本与净利润的同期变化',
+        subtitle: '按北京时间统计本周（周一至今）或本月（1 日至今）的营收、成本与净利润',
         periodRevenue: '周期营收',
         periodCost: '周期成本',
         periodProfit: '周期净利润',

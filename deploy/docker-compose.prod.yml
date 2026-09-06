@@ -3,8 +3,12 @@
 services:
   # TransitHub 应用服务：包含 Go 后端和已构建的前端静态文件。
   app:
-    # 发布部署必须使用与代码内置版本号一致的固定镜像 tag。
-    image: deviseo/transithub:v0.1.15
+    # 默认从此 Fork 的当前源码构建，固定名称仅为本地镜像标签，不拉取上游旧镜像。
+    image: transit-hub:v0.1.16
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:

@@ -1,13 +1,14 @@
 {
   "name": "@transithub/frontend",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit -p tsconfig.app.json && vite build",
     "preview": "vite preview",
-    "typecheck": "vue-tsc --noEmit -p tsconfig.app.json"
+    "typecheck": "vue-tsc --noEmit -p tsconfig.app.json",
+    "test:dashboard": "node --experimental-strip-types --test tests/dashboardMetrics.test.ts"
   },
   "dependencies": {
     "@vueuse/core": "^14.3.0",

@@ -40,7 +40,7 @@ const loadVersionInfo = async () => {
 }
 
 // GitHub 仓库地址是本项目唯一来源，版本号链接和图标入口都从这里派生，避免散落硬编码。
-const githubRepoUrl = 'https://github.com/deviseo/transit-hub'
+const githubRepoUrl = 'https://github.com/gwenliu1025/transit-hub'
 const githubReleasesUrl = `${githubRepoUrl}/releases`
 
 // 非正式发布的占位版本号（本地预览/开发/未设置 APP_VERSION 时的默认值）不对应真实 tag，

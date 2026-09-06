@@ -12,3 +12,7 @@ backend/dist
 .env.*
 docs
 development-docs
+
+# 本机恢复资产与任务缓存不进入镜像构建上下文。
+.local
+_skill-cache

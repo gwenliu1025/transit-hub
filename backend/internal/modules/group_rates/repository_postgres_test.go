@@ -19,10 +19,11 @@ const postgresTestTimeout = 15 * time.Second
 
 func TestRepositoryListMappedWithPostgres(t *testing.T) {
 	tests := []struct {
-		name            string
-		snapshotGroupID string
-		wantMapped      bool
-		arrange         func(t *testing.T, pool *pgxpool.Pool)
+		name              string
+		snapshotGroupID   string
+		wantMapped        bool
+		wantPricingMapped bool
+		arrange           func(t *testing.T, pool *pgxpool.Pool)
 	}{
 		{
 			name:            "stable ID survives renamed connection",
@@ -66,9 +67,11 @@ func TestRepositoryListMappedWithPostgres(t *testing.T) {
 			},
 		},
 		{
-			name:            "existing JSON mapping remains supported",
-			snapshotGroupID: "54",
-			wantMapped:      true,
+			// 定价映射只影响 PricingMapped，Mapped 仍只表示真实连接。
+			name:              "JSON 定价映射不等同于真实连接",
+			snapshotGroupID:   "54",
+			wantMapped:        false,
+			wantPricingMapped: true,
 			arrange: func(t *testing.T, pool *pgxpool.Pool) {
 				insertJSONMapping(t, pool, "workspace-a")
 			},
@@ -109,6 +112,9 @@ func TestRepositoryListMappedWithPostgres(t *testing.T) {
 			}
 			if result.Items[0].Mapped != test.wantMapped {
 				t.Fatalf("Mapped = %v, want %v", result.Items[0].Mapped, test.wantMapped)
+			}
+			if result.Items[0].PricingMapped != test.wantPricingMapped {
+				t.Fatalf("PricingMapped = %v, want %v", result.Items[0].PricingMapped, test.wantPricingMapped)
 			}
 		})
 	}

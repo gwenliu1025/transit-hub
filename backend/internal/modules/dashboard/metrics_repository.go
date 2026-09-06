@@ -106,12 +106,14 @@ func (r *MetricsRepository) Upsert(ctx context.Context, snapshot DailySnapshot) 
 // ListRange 查询指定用户指定工作区最近 days 天的快照记录，按日期升序返回。
 // 不包含当天（当天的数据由 LiveMetrics 实时提供），仅返回已保存的历史日期。
 func (r *MetricsRepository) ListRange(ctx context.Context, userID, adminAccountID string, days int) ([]DailySnapshot, error) {
+	// 与实时指标和快照写入共用北京时间日期，不依赖数据库会话的 CURRENT_DATE。
+	today := time.Now().In(beijingLocation)
 	rows, err := r.db.Query(ctx, `
 		SELECT id, user_id, admin_account_id, date, today_profit, site_balance, today_purchase, net_profit, upstream_balance, created_at
 		FROM dashboard_daily_stats
-		WHERE user_id = $1 AND admin_account_id = $2 AND date >= (CURRENT_DATE - $3::int) AND date < CURRENT_DATE
+		WHERE user_id = $1 AND admin_account_id = $2 AND date >= ($4::date - $3::int) AND date < $4::date
 		ORDER BY date ASC
-	`, userID, adminAccountID, days)
+	`, userID, adminAccountID, days, today)
 	if err != nil {
 		return nil, err
 	}

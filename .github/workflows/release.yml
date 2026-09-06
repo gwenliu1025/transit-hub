@@ -1,0 +1,79 @@
+name: Verify and release TransitHub
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: transithub_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d transithub_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: 验证版本与默认部署入口
+        run: node scripts/verify-release.mjs
+      - name: 验证前端
+        working-directory: frontend
+        run: npm ci && npm run test:dashboard && npm run build
+      - name: 验证后端与真实 PostgreSQL
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/transithub_test?sslmode=disable
+        run: go test -race -count=1 -timeout=3m ./... && go vet ./... && go build ./...
+      - name: 验证部署模板
+        run: docker compose -f deploy/docker-compose.prod.yml config --quiet
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建带来源标识的生产镜像
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          docker build -f deploy/Dockerfile -t "transit-hub:$RELEASE_TAG" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
+            --label "org.opencontainers.image.version=$RELEASE_TAG" .
+          docker save "transit-hub:$RELEASE_TAG" | gzip > "transithub-$RELEASE_TAG-linux-amd64.tar.gz"
+          sha256sum "transithub-$RELEASE_TAG-linux-amd64.tar.gz" > SHA256SUMS
+      - name: 发布固定版本与校验和
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            "transithub-$RELEASE_TAG-linux-amd64.tar.gz" SHA256SUMS \
+            --verify-tag --latest --title "TransitHub $RELEASE_TAG" \
+            --notes-file "docs/releases/$RELEASE_TAG.md"

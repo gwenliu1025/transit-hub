@@ -52,6 +52,7 @@ import type { ConnectionHealthStoredSummary } from '../types/connectionHealth'
 import type { DashboardColorToken, DashboardMetricData, DashboardMetricKey, DashboardPeriod } from '../types/dashboard'
 import type { DashboardAdminPlatform, Sub2apiAuthMethod } from '../types/dashboardAdmin'
 import { computeDelta, formatCny, formatDateTime } from '../utils/dashboard'
+import { dashboardDate } from '../utils/dashboardMetrics'
 
 const { t, locale } = useI18n()
 const router = useRouter()
@@ -130,7 +131,8 @@ const refreshDataFailed = ref(false)
 const lastUpdatedAt = ref<number | null>(null)
 
 const hydrateSnapshot = (snapshot: DashboardDataSnapshot | null): boolean => {
-  if (!snapshot) return false
+  // 跨业务日的实时值不再作为今天的数据恢复，避免月初混入上月缓存。
+  if (!snapshot || dashboardDate(new Date(snapshot.updatedAt)) !== dashboardDate()) return false
   adminStatus.value = snapshot.adminStatus
   groupCount.value = snapshot.live.groupCount ?? null
   groupUsage.value = snapshot.groupUsage ?? null
@@ -277,8 +279,8 @@ const profitMargin = computed(() => {
 })
 
 const marginSeries = computed(() => {
-  const revenue = metric('todayProfit')?.series.month ?? []
-  const profit = metric('netProfit')?.series.month ?? []
+  const revenue = metric('todayProfit')?.comparison ?? []
+  const profit = metric('netProfit')?.comparison ?? []
   return revenue.map((point, index) => point.value > 0 ? ((profit[index]?.value ?? 0) / point.value) * 100 : 0)
 })
 
@@ -298,7 +300,7 @@ const cards = computed<DashboardCoreCard[]>(() => {
   const result: DashboardCoreCard[] = (['todayProfit', 'todayPurchase', 'netProfit'] as DashboardMetricKey[]).flatMap((key) => {
     const current = metric(key)
     if (!current) return []
-    const delta = computeDelta(current.series.month.map(point => point.value))
+    const delta = computeDelta(current.comparison.map(point => point.value))
     return [{
       key,
       label: t(METRIC_META[key].labelKey),

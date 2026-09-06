@@ -1,7 +1,7 @@
 // 仪表盘统计相关类型定义。
 // 这些指标语义与「我的站点」概览保持一致，后续会由后端统计接口提供真实数据。
 
-/** 趋势图统计周期：周（最近 7 天）/ 月（最近 30 天）。 */
+/** 趋势图统计周期：北京时间本周（周一至今）/ 本月（1 日至今）。 */
 export type DashboardPeriod = 'week' | 'month'
 
 /** 仪表盘的五个核心指标。 */
@@ -34,5 +34,7 @@ export interface DashboardMetricData {
   color: DashboardColorToken
   /** 当前值（“今天”的数值），即月序列最后一个点。 */
   current: number
+  /** 日对比使用的最后两个有效点，不随自然周或自然月截断。 */
+  comparison: TrendPoint[]
   series: MetricSeries
 }

@@ -420,8 +420,8 @@ export default {
       },
       period: {
         label: 'Period',
-        week: 'Week',
-        month: 'Month'
+        week: 'This Week',
+        month: 'This Month'
       },
       delta: {
         vsPrev: 'vs prev day',
@@ -432,7 +432,7 @@ export default {
       },
       performance: {
         title: 'Business Performance',
-        subtitle: 'Revenue, cost, and net profit over the same period',
+        subtitle: 'Revenue, cost, and net profit from Monday or the 1st of this month to date (Asia/Shanghai)',
         periodRevenue: 'Period Revenue',
         periodCost: 'Period Cost',
         periodProfit: 'Period Net Profit',

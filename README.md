@@ -103,19 +103,19 @@ The project is built as a Go backend with a Vue 3 admin frontend, backed by Post
 
 ### Docker Compose
 
-Production compose files live under `deploy/`.
+Production compose files live under `deploy/`. The default builds this Fork from source rather than pulling an old upstream image. Business Performance uses the current calendar week (Monday to date) and month (the 1st to date), both in Asia/Shanghai. Published artifacts are available in [Releases](https://github.com/gwenliu1025/transit-hub/releases).
 
 ```bash
-git clone https://github.com/deviseo/transit-hub.git transit-hub
+git clone https://github.com/gwenliu1025/transit-hub.git transit-hub
 cd transit-hub
 
 # Edit deploy/docker-compose.prod.yml first:
-# - image tag (defaults to deviseo/transithub:v0.1.15)
+# - locally built image tag (defaults to transit-hub:v0.1.16)
 # - replace every change-this-* placeholder
 # - database password in both DATABASE_URL and POSTGRES_PASSWORD
 # - ADMIN_EMAIL / ADMIN_PASSWORD
 
-docker compose -f deploy/docker-compose.prod.yml up -d
+docker compose -f deploy/docker-compose.prod.yml up -d --build
 ```
 
 Open:
@@ -163,7 +163,7 @@ This starts PostgreSQL and Redis on local ports `5432` and `6379`.
 Because the Dockerfile is stored in `deploy/` but expects the repository root as build context, build with:
 
 ```bash
-docker build -f deploy/Dockerfile -t deviseo/transithub:v0.1.15 .
+docker build -f deploy/Dockerfile -t transit-hub:v0.1.16 .
 ```
 
 ## Local Development

@@ -103,19 +103,19 @@ TransitHub 是一个自部署的后台运营中心，用于管理多个上游站
 
 ### Docker Compose
 
-生产部署文件位于 `deploy/` 目录。
+生产部署文件位于 `deploy/` 目录。默认从此 Fork 的源码构建镜像，不从上游拉取旧版本。经营表现按北京时间统计本周（周一至今）和本月（1 日至今），不使用滚动 7/30 天。正式产物见 [Releases](https://github.com/gwenliu1025/transit-hub/releases)。
 
 ```bash
-git clone https://github.com/deviseo/transit-hub.git transit-hub
+git clone https://github.com/gwenliu1025/transit-hub.git transit-hub
 cd transit-hub
 
 # 先编辑 deploy/docker-compose.prod.yml：
-# - 镜像 tag（默认使用 deviseo/transithub:v0.1.15）
+# - 本地构建的镜像标签（默认 transit-hub:v0.1.16）
 # - 替换所有 change-this-* 占位值
 # - DATABASE_URL 和 POSTGRES_PASSWORD 中的数据库密码
 # - ADMIN_EMAIL / ADMIN_PASSWORD
 
-docker compose -f deploy/docker-compose.prod.yml up -d
+docker compose -f deploy/docker-compose.prod.yml up -d --build
 ```
 
 访问地址：
@@ -163,7 +163,7 @@ docker compose -f deploy/docker-compose.yml up -d
 由于 Dockerfile 放在 `deploy/`，但构建上下文需要使用仓库根目录，请使用：
 
 ```bash
-docker build -f deploy/Dockerfile -t deviseo/transithub:v0.1.15 .
+docker build -f deploy/Dockerfile -t transit-hub:v0.1.16 .
 ```
 
 ## 本地开发
