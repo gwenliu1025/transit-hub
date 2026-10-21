@@ -1,5 +1,7 @@
 # TransitHub
 
+Fork 定制、上游更新与回归入口：[维护说明](docs/FORK_MAINTENANCE.md)。
+
 <div align="center">
 
 [![Go](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)](https://golang.org/)

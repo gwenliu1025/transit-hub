@@ -20,3 +20,10 @@ backend/.prisma
 *.tsbuildinfo
 development-docs/
 data/
+
+# 本机恢复资产与任务缓存不进入公开仓库。
+.local/
+_skill-cache/
+backend/api.exe
+# 本机状态单独维护；公开维护契约位于 docs/FORK_MAINTENANCE.md。
+/CURRENT_STATE.md
