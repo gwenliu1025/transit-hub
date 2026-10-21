@@ -34,8 +34,8 @@ func isValidHost(host string) bool {
 	return hostDomainPattern.MatchString(host)
 }
 
-func isPublicHTTPSURL(raw string) bool {
-	_, err := egress.ValidatePublicHTTPS(context.Background(), raw, net.DefaultResolver)
+func isPublicHTTPURL(raw string) bool {
+	_, err := egress.ValidatePublicHTTP(context.Background(), raw, net.DefaultResolver)
 	return err == nil
 }
 

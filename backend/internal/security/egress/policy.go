@@ -15,6 +15,7 @@ import (
 var ErrTargetNotPublic = errors.New("出站目标必须是公网地址")
 
 var errTooManyRedirects = errors.New("重定向次数过多")
+var errUnsafeRedirect = errors.New("拒绝 HTTPS 降级或跨来源重放请求体")
 
 type Resolver interface {
 	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
@@ -58,15 +59,21 @@ func (d *PublicNetworkDialer) DialContext(ctx context.Context, network, address 
 // NewPublicHTTPSClient 创建一个只允许公网 HTTPS 目标的客户端。
 // DNS 在每次建立连接前重新解析并校验，重定向也使用同一策略。
 func NewPublicHTTPSClient(timeout time.Duration, resolver Resolver) *http.Client {
-	return newPublicHTTPSClient(timeout, resolver, nil)
+	return newPublicClient(timeout, resolver, nil, ValidatePublicHTTPS)
 }
 
 // NewPublicHTTPSClientWithProxy 创建同样受公网 HTTPS 策略保护、并通过指定公网代理出站的客户端。
 func NewPublicHTTPSClientWithProxy(timeout time.Duration, resolver Resolver, proxyURL *url.URL) *http.Client {
-	return newPublicHTTPSClient(timeout, resolver, proxyURL)
+	return newPublicClient(timeout, resolver, proxyURL, ValidatePublicHTTPS)
 }
 
-func newPublicHTTPSClient(timeout time.Duration, resolver Resolver, proxyURL *url.URL) *http.Client {
+// NewPublicHTTPClient 供显式支持明文站点的消费者使用，不放宽其他 HTTPS-only 客户端。
+// HTTP 与 HTTPS 共用公网校验和拨号策略；允许 HTTP 起点不代表允许 HTTPS 降级。
+func NewPublicHTTPClient(timeout time.Duration, resolver Resolver) *http.Client {
+	return newPublicClient(timeout, resolver, nil, ValidatePublicHTTP)
+}
+
+func newPublicClient(timeout time.Duration, resolver Resolver, proxyURL *url.URL, validate func(context.Context, string, Resolver) (*url.URL, error)) *http.Client {
 	dialer := NewPublicNetworkDialer(timeout, resolver)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = dialer.DialContext
@@ -81,8 +88,18 @@ func newPublicHTTPSClient(timeout time.Duration, resolver Resolver, proxyURL *ur
 		if len(via) >= 10 {
 			return errTooManyRedirects
 		}
-		if _, err := ValidatePublicHTTPS(req.Context(), req.URL.String(), resolver); err != nil {
+		if _, err := validate(req.Context(), req.URL.String(), resolver); err != nil {
 			return err
+		}
+		if len(via) > 0 {
+			previous := via[len(via)-1]
+			if previous.URL.Scheme == "https" && req.URL.Scheme == "http" {
+				return errUnsafeRedirect
+			}
+			// 307/308 会保留登录密码等请求体，删除 Header 并不足以防止跨来源泄漏。
+			if !sameOrigin(via[0].URL, req.URL) && req.Body != nil && req.Body != http.NoBody {
+				return errUnsafeRedirect
+			}
 		}
 		if len(via) > 0 && !sameOrigin(via[0].URL, req.URL) {
 			for _, header := range []string{"Authorization", "Cookie", "Proxy-Authorization", "X-Api-Key", "New-Api-User"} {
@@ -91,28 +108,44 @@ func newPublicHTTPSClient(timeout time.Duration, resolver Resolver, proxyURL *ur
 		}
 		return nil
 	}
-	client.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		if _, err := ValidatePublicHTTPS(req.Context(), req.URL.String(), resolver); err != nil {
-			return nil, err
-		}
-		return transport.RoundTrip(req)
-	})
+	client.Transport = &publicTransport{transport: transport, resolver: resolver, validate: validate}
 	return client
+}
+
+type publicTransport struct {
+	transport *http.Transport
+	resolver  Resolver
+	validate  func(context.Context, string, Resolver) (*url.URL, error)
+}
+
+func (t *publicTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if _, err := t.validate(req.Context(), req.URL.String(), t.resolver); err != nil {
+		return nil, err
+	}
+	return t.transport.RoundTrip(req)
+}
+
+// 外层安全包装仍将闲置连接清理交回真正持有连接池的 Transport。
+func (t *publicTransport) CloseIdleConnections() {
+	t.transport.CloseIdleConnections()
 }
 
 func sameOrigin(left, right *url.URL) bool {
 	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
 }
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
 func ValidatePublicHTTPS(ctx context.Context, raw string, resolver Resolver) (*url.URL, error) {
 	parsed, err := parsePublicURL(ctx, raw, resolver)
 	if err != nil || parsed.Scheme != "https" {
+		return nil, ErrTargetNotPublic
+	}
+	return parsed, nil
+}
+
+// ValidatePublicHTTP 只放行公网 HTTP/HTTPS 站点，仍拒绝凭据、私网和其他协议。
+func ValidatePublicHTTP(ctx context.Context, raw string, resolver Resolver) (*url.URL, error) {
+	parsed, err := parsePublicURL(ctx, raw, resolver)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, ErrTargetNotPublic
 	}
 	return parsed, nil

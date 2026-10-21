@@ -31,14 +31,14 @@ type PlatformService struct {
 }
 
 func NewPlatformService(httpClient *HTTPClient) *PlatformService {
-	return &PlatformService{httpClient: httpClient, validateURL: isPublicHTTPSURL}
+	return &PlatformService{httpClient: httpClient, validateURL: isPublicHTTPURL}
 }
 
 // newPlatformServiceWithURLValidator 仅供包内测试显式注入 URL 校验器；生产路径必须使用
-// NewPlatformService 的公网 HTTPS 默认策略。
+// NewPlatformService 的公网 HTTP/HTTPS 默认策略。
 func newPlatformServiceWithURLValidator(httpClient *HTTPClient, validateURL func(string) bool) *PlatformService {
 	if validateURL == nil {
-		validateURL = isPublicHTTPSURL
+		validateURL = isPublicHTTPURL
 	}
 	return &PlatformService{httpClient: httpClient, validateURL: validateURL}
 }
@@ -76,7 +76,7 @@ func (s *PlatformService) NormalizeURL(value string) (string, error) {
 		trimmed = "https://" + trimmed
 	}
 	parsed, err := url.Parse(trimmed)
-	// 生产校验器进一步收紧为公网 HTTPS；测试 seam 仍只可放宽到 HTTP/HTTPS。
+	// 协议由 egress 的站点策略持有；此处同时保留地址语法与错误映射。
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || !isValidHost(parsed.Hostname()) || s.validateURL == nil || !s.validateURL(trimmed) {
 		return "", newRequestError(ErrorInvalidURL, "")
 	}

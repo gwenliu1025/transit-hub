@@ -37,10 +37,10 @@ type RealProbeRunner struct {
 }
 
 func NewRealProbeRunner() *RealProbeRunner {
-	return &RealProbeRunner{client: egress.NewPublicHTTPSClient(ProbeTimeout, nil)}
+	return &RealProbeRunner{client: egress.NewPublicHTTPClient(ProbeTimeout, nil)}
 }
 
-// NewRealProbeRunnerWithClient 允许测试显式注入本地 HTTP client；生产默认构造器保持公网 HTTPS 策略。
+// NewRealProbeRunnerWithClient 允许测试显式注入本地 HTTP client；生产默认构造器保持公网 HTTP/HTTPS 策略。
 func NewRealProbeRunnerWithClient(client *http.Client) *RealProbeRunner {
 	return &RealProbeRunner{client: client}
 }

@@ -33,10 +33,10 @@ type ModelDiscoveryRunner struct {
 }
 
 func NewModelDiscoveryRunner() *ModelDiscoveryRunner {
-	return &ModelDiscoveryRunner{client: egress.NewPublicHTTPSClient(modelDiscoveryTimeout, nil)}
+	return &ModelDiscoveryRunner{client: egress.NewPublicHTTPClient(modelDiscoveryTimeout, nil)}
 }
 
-// NewModelDiscoveryRunnerWithClient 允许测试显式注入本地 HTTP client；生产默认构造器保持公网 HTTPS 策略。
+// NewModelDiscoveryRunnerWithClient 允许测试显式注入本地 HTTP client；生产默认构造器保持公网 HTTP/HTTPS 策略。
 func NewModelDiscoveryRunnerWithClient(client *http.Client) *ModelDiscoveryRunner {
 	return &ModelDiscoveryRunner{client: client}
 }

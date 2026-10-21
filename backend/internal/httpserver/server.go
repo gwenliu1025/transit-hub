@@ -53,6 +53,11 @@ type Server struct {
 	lotteryWorker                  *lottery.Worker
 }
 
+// 上游站点的协议兼容仅在该装配入口选择，其他 HTTPS-only 消费者保持独立。
+func newUpstreamHTTPClient() *http.Client {
+	return egress.NewPublicHTTPClient(upstreamRequestTimeout, nil)
+}
+
 func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server {
 	server := &Server{
 		cfg:     cfg,
@@ -85,7 +90,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 		panic(err)
 	}
 	group_rates.RegisterRoutes(server.mux, groupRatesService, adminAccountsService)
-	upstreamHTTPClient := egress.NewPublicHTTPSClient(upstreamRequestTimeout, nil)
+	upstreamHTTPClient := newUpstreamHTTPClient()
 	platformService := upstream.NewPlatformService(upstream.NewHTTPClient(upstreamHTTPClient))
 	upstreamCache := upstream.NewRedisSiteCache(redisClient)
 	upstreamService := upstream.NewService(platformService, upstreamRepository, groupRateSnapshotWriter{service: groupRatesService}, upstreamCache)

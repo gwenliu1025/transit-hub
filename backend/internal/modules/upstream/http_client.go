@@ -37,7 +37,7 @@ type jsonResponse struct {
 
 func NewHTTPClient(client *http.Client) *HTTPClient {
 	if client == nil {
-		client = egress.NewPublicHTTPSClient(60*time.Second, nil)
+		client = egress.NewPublicHTTPClient(60*time.Second, nil)
 	}
 	return &HTTPClient{client: client}
 }
