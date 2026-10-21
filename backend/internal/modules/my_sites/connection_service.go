@@ -106,7 +106,12 @@ func (s *Service) prepareConnectionContext(ctx context.Context, userID, siteID, 
 	}
 
 	groupType, multiplierLabel := resolveGroupInfo(upstreamSite.Metrics.Groups, strings.TrimSpace(groupID))
-	if groupType == "" {
+	if requireAdminResourceType && state.Session.Platform == upstream.PlatformSub2API {
+		groupType, err = resolveAccountGroupType(groupType, requestedType, upstreamSite.Session.Platform == upstream.PlatformNewAPI)
+		if err != nil {
+			return connectionContext{}, err
+		}
+	} else if groupType == "" {
 		groupType = strings.ToLower(strings.TrimSpace(requestedType))
 	}
 	resolvedName := strings.TrimSpace(groupName)
@@ -114,11 +119,6 @@ func (s *Service) prepareConnectionContext(ctx context.Context, userID, siteID, 
 		resolvedName = strings.TrimSpace(groupID)
 	}
 	if resolvedName == "" {
-		return connectionContext{}, requestError(ErrorRequest)
-	}
-	// A Sub2API admin account requires a concrete provider type even when the
-	// upstream side is NewAPI and its group itself has no type metadata.
-	if requireAdminResourceType && state.Session.Platform == upstream.PlatformSub2API && groupType == "" {
 		return connectionContext{}, requestError(ErrorRequest)
 	}
 

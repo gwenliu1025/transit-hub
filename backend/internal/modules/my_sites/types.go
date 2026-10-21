@@ -13,6 +13,8 @@ const (
 	ErrorUnknown                = "admin.mySites.errors.unknown"
 	ErrorInvalidAutoPricingConf = "admin.mySites.errors.invalidAutoPricingConfig"
 	ErrorConnectionExists       = "admin.mySites.errors.connectionExists"
+	ErrorGroupTypeRequired      = "admin.mySites.errors.groupTypeRequired"
+	ErrorGroupTypeInvalid       = "admin.mySites.errors.groupTypeInvalid"
 	ErrorManagedDeleteOnly      = "admin.mySites.errors.managedDeleteOnly"
 )
 
@@ -129,6 +131,7 @@ type ConnectionCapabilities struct {
 	Mode                        string              `json:"mode"`
 	RequiresGroupType           bool                `json:"requiresGroupType"`
 	RequiresChannelType         bool                `json:"requiresChannelType"`
+	GroupTypes                  []GroupTypeOption   `json:"groupTypes,omitempty"`
 	ChannelTypes                []ChannelTypeOption `json:"channelTypes,omitempty"`
 	SuggestedChannelTypeByGroup map[string]int      `json:"suggestedChannelTypeByGroup,omitempty"`
 }

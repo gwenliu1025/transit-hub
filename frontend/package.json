@@ -8,6 +8,7 @@
     "build": "vue-tsc --noEmit -p tsconfig.app.json && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit -p tsconfig.app.json",
+    "test:connections": "node --experimental-strip-types --test tests/connections.test.ts",
     "test:dashboard": "node --experimental-strip-types --test tests/dashboardMetrics.test.ts"
   },
   "dependencies": {

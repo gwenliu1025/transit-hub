@@ -16,6 +16,7 @@
 | Ticket/Lottery 嵌入身份绑定与撤销 | `tickets/`、`lottery/service.go` | 同模块身份、来源与会话撤销回归 |
 | 请求/响应预算与工作区调度隔离 | `backend/internal/shared/httpjson/`、`backend/internal/httpserver/server.go`、`settings/`、`upstream/service.go` | 请求/响应上限、`settings/strategy_workspace_test.go`、`upstream/refresh_scheduler_test.go` |
 | 真实对接幂等预留与补偿边界 | `my_sites/connection_service.go`、`repository.go`；迁移 `000019` | `my_sites/connection_idempotency_test.go`、`backend/internal/database/migrations/idempotency_migration_test.go` |
+| New API 对接协议选择与错误边界 | `my_sites/connection_protocol.go`、`connection_service.go`、`handler.go`；前端 `GroupRatesView.vue` 与 `utils/connectionOptions.ts` | `my_sites/connection_protocol_test.go`；`frontend/tests/connections.test.ts`；[修复与验证记录](audits/2026-10-21-newapi-group-connection-fix.md) |
 | 自然周/月经营统计、昨日对比与跨日缓存 | `frontend/src/modules/admin/utils/dashboardMetrics.ts`、`composables/useDashboardMetrics.ts`；后端历史日期查询 | `frontend/tests/dashboardMetrics.test.ts`；`dashboard/metrics_repository_postgres_test.go` |
 | Fork 部署来源与发布版本一致性 | `backend/internal/config/config.go`、`scripts/verify-release.mjs`、`.github/workflows/release.yml` | `node scripts/verify-release.mjs` 与发布工作流 |
 
@@ -36,6 +37,6 @@
 1. 核对当前工作树和现有分支，先辨明每个未提交文件的来源。个人 Fork 为 `origin`，作者为只读 `upstream`；只获取已有目标引用，记录当前 Fork、作者和共同祖先，不为更新擅自创建分支。
 2. 做三方比较：共同祖先→Fork 定制、共同祖先→作者新增、当前工作树→HEAD。仅图表/文档更新与业务更新分开判断；对上表每个受影响 owner 检查作者是否已吸收、实现是否等价、测试是否仍覆盖。旧草稿不直接覆盖正式实现。
 3. 在获准的现有分支完成最小整合；旧定制只有在需求明确被替代或已被作者等价吸收且验证成立时退出。冲突或尚未采用的旧草稿差异保留为待处理证据，不静默选边。
-4. 执行后端 `go test -count=1 -timeout=3m ./...`、`go test -race -count=1 -timeout=3m ./...`、`go vet ./...`、`go build ./...`；前端 `npm run test:dashboard`、`npm run typecheck`、`npm run build`；根目录 `node scripts/verify-release.mjs` 与差异空白检查。真实 PostgreSQL 使用独立 `TEST_DATABASE_URL`，跳过不算集成通过；环境缺口不借生产依赖补测。
+4. 执行后端 `go test -count=1 -timeout=3m ./...`、`go test -race -count=1 -timeout=3m ./...`、`go vet ./...`、`go build ./...`；前端 `npm run test:dashboard`、`npm run test:connections`、`npm run typecheck`、`npm run build`；根目录 `node scripts/verify-release.mjs` 与差异空白检查。真实 PostgreSQL 使用独立 `TEST_DATABASE_URL`，跳过不算集成通过；环境缺口不借生产依赖补测。
 5. 独立检查同一最终来源和全部直接消费者后，按闭包显式选择文件形成可审查提交，记录测试及未验证边界。`.local/`、`_skill-cache/`、本机状态、凭据、临时二进制与恢复包不进入公开提交；不要使用整树盲目提交。
 6. 发布继续以 `defaultAppVersion` 和现有发布一致性脚本/工作流为准，不套用其他项目的版本规则。提交、推送、发布、生产切换是不同动作；缺少对应授权时停在当前已完成层。撤销本次修复使用本次提交的反向补丁，不硬重置带有既有修改的工作树，不恢复旧数据库来撤回纯代码变更。

@@ -67,6 +67,7 @@ export interface ConnectionCapabilities {
   mode: 'account' | 'channel' | string
   requiresGroupType: boolean
   requiresChannelType: boolean
+  groupTypes?: { id: string; name: string }[]
   channelTypes?: NewAPIChannelType[]
   suggestedChannelTypeByGroup?: Record<string, number>
 }

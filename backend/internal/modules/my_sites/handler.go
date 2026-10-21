@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"transithub/backend/internal/modules/upstream"
 	"transithub/backend/internal/shared/authctx"
 	"transithub/backend/internal/shared/httpjson"
 )
@@ -268,6 +269,15 @@ func writeError(w http.ResponseWriter, err error) {
 		}
 		httpjson.WriteError(w, status, requestErr.Error())
 		return
+	}
+	// 仅公开固定错误键；远端认证错误不是本站登录过期，不返回本地 401。
+	var remoteErr *upstream.RequestError
+	if errors.As(err, &remoteErr) {
+		switch remoteErr.MessageKey {
+		case upstream.ErrorInvalidURL, upstream.ErrorAuth, upstream.ErrorNetwork, upstream.ErrorRequest, upstream.ErrorInvalidResponse, upstream.ErrorNotFound:
+			httpjson.WriteError(w, http.StatusBadGateway, remoteErr.MessageKey)
+			return
+		}
 	}
 	httpjson.WriteError(w, http.StatusInternalServerError, ErrorUnknown)
 }

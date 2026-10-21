@@ -39,7 +39,7 @@ jobs:
         run: node scripts/verify-release.mjs
       - name: 验证前端
         working-directory: frontend
-        run: npm ci && npm run test:dashboard && npm run build
+        run: npm ci && npm run test:dashboard && npm run test:connections && npm run build
       - name: 验证后端与真实 PostgreSQL
         working-directory: backend
         env:

@@ -10,6 +10,7 @@ import { useGroupRates } from '../composables/useGroupRates'
 import type { GroupRate, GroupRateHistoryRow } from '../types/groupRates'
 import type { AdminResourceOption, ConnectionCapabilities, MySiteMapping, MySiteMappingOwnGroupOption, RealConnection, UpstreamKeyItem } from '../types/mySites'
 import { LEGACY_NEW_API_CHANNEL_SUGGESTIONS, NEW_API_CHANNEL_TYPES } from '../types/mySites'
+import { connectionErrorKey, effectiveConnectionProtocol, knownConnectionProtocol } from '../utils/connectionOptions'
 
 const { t, locale } = useI18n()
 const router = useRouter()
@@ -100,6 +101,24 @@ const handleDialogKeydown = (event: KeyboardEvent) => {
     first.focus()
   }
 }
+const mappingOptionsError = ref('')
+const keysError = ref('')
+const adminResourcesError = ref('')
+const isLoadingMappingOptions = ref(false)
+// 弹窗、模式和读取目标改变时使旧请求失效，错误响应也不覆盖新选择。
+let connectorEpoch = 0
+let mappingRequest = 0
+let keysRequest = 0
+let resourcesRequest = 0
+const invalidateConnectorReads = () => {
+  connectorEpoch++
+  isLoadingMappingOptions.value = false
+  isLoadingKeys.value = false
+  isLoadingAdminResources.value = false
+  mappingOptionsError.value = ''
+  keysError.value = ''
+  adminResourcesError.value = ''
+}
 const selectedGroupType = ref('')
 const selectedChannelType = ref(0)
 const adminPlatform = ref('')
@@ -130,7 +149,8 @@ const firstMappedOwnGroupForRate = (rate: GroupRate): string => mappedOwnGroupsF
 const filteredOwnGroups = computed(() => {
   // new-api admin 不按渠道类型筛选，直接显示全部自有分组
   if (isAdminNewAPI.value) return ownGroups.value
-  const upstreamType = (connectingRate.value?.type || selectedGroupType.value).toLowerCase()
+  const upstreamType = effectiveGroupType.value
+  if (connectionCapabilities.value?.requiresGroupType && !upstreamType) return []
   if (upstreamType) {
     return ownGroups.value.filter(g => g.platform.toLowerCase() === upstreamType)
   }
@@ -234,41 +254,48 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  invalidateConnectorReads()
   if (searchDebounceTimer) clearTimeout(searchDebounceTimer)
   document.removeEventListener('keydown', handleDialogKeydown)
   document.body.style.overflow = previousBodyOverflow
 })
 
-const isAdminNewAPI = computed(() => adminPlatform.value === 'newapi')
-const needsGroupTypeSelection = computed(() => (
-  connectMode.value === 'real' &&
-  (connectionCapabilities.value?.requiresGroupType ?? (!connectingRate.value?.type && !isAdminNewAPI.value))
-) && !connectingRate.value?.type)
-const needsChannelTypeSelection = computed(() => connectMode.value === 'real' && (connectionCapabilities.value?.requiresChannelType ?? isAdminNewAPI.value))
-
-// new-api admin：根据自有分组类型过滤可选的渠道类型
-// 分组类型已知时只显示对应渠道，未知时显示全部
-const filteredChannelTypes = computed(() => {
-  const groupType = (connectingRate.value?.type || '').toLowerCase()
-  const available = connectionCapabilities.value?.channelTypes?.length
-    ? connectionCapabilities.value.channelTypes
-    : NEW_API_CHANNEL_TYPES
-  const suggestedId = connectionCapabilities.value?.suggestedChannelTypeByGroup?.[groupType]
-    ?? LEGACY_NEW_API_CHANNEL_SUGGESTIONS[groupType]
-  if (suggestedId) {
-    return available.filter(channelType => channelType.id === suggestedId)
-  }
-  return available
+const isAdminNewAPI = computed(() => connectionCapabilities.value ? connectionCapabilities.value.mode === 'channel' : adminPlatform.value === 'newapi')
+const creationCapabilitiesError = computed(() => {
+  if (!hasLoadedMappingOptions.value) return ''
+  const capabilities = connectionCapabilities.value
+  if (capabilities?.mode === 'account' && capabilities.requiresGroupType && capabilities.groupTypes?.length) return ''
+  if (capabilities?.mode === 'channel' && capabilities.requiresChannelType && capabilities.channelTypes?.length) return ''
+  return t('admin.groupRates.connect.capabilitiesUnavailable')
 })
+const groupTypeOptions = computed(() => connectionCapabilities.value?.groupTypes ?? [])
+const effectiveGroupType = computed(() => effectiveConnectionProtocol(connectingRate.value?.platform, connectingRate.value?.type, selectedGroupType.value, connectionCapabilities.value))
+const needsGroupTypeSelection = computed(() => connectMode.value === 'real' && Boolean(connectionCapabilities.value?.requiresGroupType) && (
+  connectingRate.value?.platform === 'newapi' || !knownConnectionProtocol(connectingRate.value?.type, connectionCapabilities.value)
+))
+const needsChannelTypeSelection = computed(() => connectMode.value === 'real' && Boolean(connectionCapabilities.value?.requiresChannelType))
+
+// 渠道建议只决定默认值，不截断管理端实际支持的渠道列表。
+const filteredChannelTypes = computed(() => connectionCapabilities.value?.channelTypes ?? [])
+const applyConnectionDefaults = () => {
+  selectedGroupType.value = knownConnectionProtocol(connectingRate.value?.type, connectionCapabilities.value)
+  const groupType = (connectingRate.value?.type ?? '').trim().toLowerCase()
+  const suggested = connectionCapabilities.value?.suggestedChannelTypeByGroup?.[groupType] ?? LEGACY_NEW_API_CHANNEL_SUGGESTIONS[groupType]
+  selectedChannelType.value = filteredChannelTypes.value.some(option => option.id === suggested) ? suggested! : 0
+}
+watch(filteredOwnGroups, (groups) => {
+  connectOwnGroups.value = connectOwnGroups.value.filter(id => groups.some(group => group.id === id))
+}, { flush: 'sync' })
 
 const canSubmitConnect = computed(() => {
-  if (!connectingRate.value) return false
+  if (!connectingRate.value || isLoadingMappingOptions.value || mappingOptionsError.value || !hasLoadedMappingOptions.value) return false
   if (connectMode.value === 'bind') {
-    return Boolean(selectedKeyId.value && selectedAdminGroupId.value && selectedAdminResourceId.value)
+    return Boolean(!isLoadingKeys.value && !keysError.value && !isLoadingAdminResources.value && !adminResourcesError.value && selectedKeyId.value && selectedAdminGroupId.value && selectedAdminResourceId.value)
   }
-  if (connectOwnGroups.value.length === 0) return false
+  if (creationCapabilitiesError.value) return false
+  if (connectOwnGroups.value.length === 0 || !connectOwnGroups.value.every(id => filteredOwnGroups.value.some(group => group.id === id))) return false
   // sub2api admin：分组类型未知时必须手动选择
-  if (needsGroupTypeSelection.value && !selectedGroupType.value) return false
+  if (connectionCapabilities.value?.requiresGroupType && !effectiveGroupType.value) return false
   // new-api admin：必须选择渠道类型
   if (needsChannelTypeSelection.value && !selectedChannelType.value) return false
   return true
@@ -381,6 +408,7 @@ const closeTypeEditor = () => {
 }
 
 const openConnector = async (rate: GroupRate) => {
+  closeConnector()
   connectingRate.value = rate
   connectOwnGroups.value = []
   connectMode.value = 'real'
@@ -388,7 +416,9 @@ const openConnector = async (rate: GroupRate) => {
   selectedChannelType.value = 0
   addToPricingMapping.value = true
   connectOperationId.value = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const epoch = connectorEpoch
   await loadMySiteMappingData()
+  if (epoch === connectorEpoch) applyConnectionDefaults()
 }
 
 const isActiveResourceStatus = (status: string): boolean => ['1', 'active', 'enabled'].includes(status.toLowerCase())
@@ -408,6 +438,7 @@ const adminResourceTypeLabel = (resource: AdminResourceOption): string => {
 }
 
 const closeConnector = () => {
+  invalidateConnectorReads()
   connectingRate.value = null
   connectOwnGroups.value = []
   connectMode.value = 'real'
@@ -426,6 +457,8 @@ const closeConnector = () => {
 }
 
 const setConnectMode = async (mode: 'real' | 'bind') => {
+  invalidateConnectorReads()
+  const epoch = connectorEpoch
   connectMode.value = mode
   connectOwnGroups.value = []
   selectedGroupType.value = ''
@@ -435,24 +468,31 @@ const setConnectMode = async (mode: 'real' | 'bind') => {
   selectedAdminResourceId.value = ''
   adminResources.value = []
   realConnectError.value = ''
+  applyConnectionDefaults()
+  if (!hasLoadedMappingOptions.value) await loadMySiteMappingData()
+  if (epoch !== connectorEpoch) return
   if (mode === 'bind' && connectingRate.value) {
     await loadUpstreamKeys(connectingRate.value)
   }
 }
 
 const loadAdminResourcesForGroup = async (groupId: string) => {
+  const epoch = connectorEpoch
+  const request = ++resourcesRequest
   selectedAdminGroupId.value = groupId
   selectedAdminResourceId.value = ''
   adminResources.value = []
+  adminResourcesError.value = ''
+  isLoadingAdminResources.value = false
   if (!groupId) return
   isLoadingAdminResources.value = true
   try {
-    adminResources.value = await listAdminResources(groupId)
-  } catch {
-    adminResources.value = []
-    realConnectError.value = t('admin.groupRates.connect.adminResourcesFailed')
+    const items = await listAdminResources(groupId)
+    if (epoch === connectorEpoch && request === resourcesRequest) adminResources.value = items
+  } catch (error) {
+    if (epoch === connectorEpoch && request === resourcesRequest) adminResourcesError.value = t(connectionErrorKey(error, 'admin.groupRates.connect.adminResourcesFailed'))
   } finally {
-    isLoadingAdminResources.value = false
+    if (epoch === connectorEpoch && request === resourcesRequest) isLoadingAdminResources.value = false
   }
 }
 
@@ -466,18 +506,40 @@ const submitTypeEditor = async () => {
   closeTypeEditor()
 }
 
-const loadMySiteMappingData = async (force = false) => {
-  if (hasLoadedMappingOptions.value && !force) return
-  isActionLoading.value = true
+const loadMySiteMappingData = async (force = false): Promise<'success' | 'failed' | 'stale'> => {
+  if (hasLoadedMappingOptions.value && !force) return 'success'
+  const epoch = connectorEpoch
+  const request = ++mappingRequest
+  isLoadingMappingOptions.value = true
+  mappingOptionsError.value = ''
   try {
     const options = await getMySiteMappingOptions()
+    if (epoch !== connectorEpoch || request !== mappingRequest) return 'stale'
     ownGroups.value = options.ownGroups
     mySiteMappings.value = options.mappings ?? []
     connectionCapabilities.value = options.connectionCapabilities ?? null
     hasLoadedMappingOptions.value = true
+    return 'success'
+  } catch (error) {
+    if (epoch !== connectorEpoch || request !== mappingRequest) return 'stale'
+    ownGroups.value = []
+    mySiteMappings.value = []
+    connectionCapabilities.value = null
+    selectedAdminGroupId.value = ''
+    selectedAdminResourceId.value = ''
+    adminResources.value = []
+    hasLoadedMappingOptions.value = false
+    mappingOptionsError.value = t(connectionErrorKey(error, 'admin.groupRates.connect.mappingOptionsFailed'))
+    return 'failed'
   } finally {
-    isActionLoading.value = false
+    if (epoch === connectorEpoch && request === mappingRequest) isLoadingMappingOptions.value = false
   }
+}
+
+const retryMappingOptions = async () => {
+  const epoch = connectorEpoch
+  await loadMySiteMappingData(true)
+  if (epoch === connectorEpoch) applyConnectionDefaults()
 }
 
 const toggleOwnGroup = (groupId: string) => {
@@ -503,7 +565,9 @@ const realConnectError = ref('')
 
 const refreshAfterMutation = async () => {
   try {
-    await Promise.all([loadRates(), loadRealConnections(), loadMySiteMappingData(true)])
+    const [, , mappingResult] = await Promise.all([loadRates(), loadRealConnections(), loadMySiteMappingData(true)])
+    // 写入成功不等于读回成功；弹窗已关闭时仍须在页面上暴露刷新失败。
+    if (mappingResult !== 'success') errorKey.value = 'admin.groupRates.errors.refreshFailed'
   } catch {
     errorKey.value = 'admin.groupRates.errors.refreshFailed'
   }
@@ -532,7 +596,7 @@ const submitRealConnect = async () => {
     upstreamSiteId: connectingRate.value.siteId,
     upstreamGroupId: connectingRate.value.groupId ?? '',
     upstreamGroupName: connectingRate.value.groupName,
-    groupType: selectedGroupType.value,
+    groupType: effectiveGroupType.value,
     channelType: selectedChannelType.value || undefined,
     ownGroupIds: connectOwnGroups.value,
     addToPricingMapping: addToPricingMapping.value,
@@ -541,8 +605,8 @@ const submitRealConnect = async () => {
   try {
     await realConnect(payload)
     closeConnector()
-  } catch {
-    realConnectError.value = t('admin.groupRates.connect.realFailed')
+  } catch (error) {
+    realConnectError.value = t(connectionErrorKey(error, 'admin.groupRates.connect.realFailed'))
     isActionLoading.value = false
     return
   }
@@ -552,13 +616,19 @@ const submitRealConnect = async () => {
 }
 
 const loadUpstreamKeys = async (rate: GroupRate) => {
+  const epoch = connectorEpoch
+  const request = ++keysRequest
+  upstreamKeys.value = []
+  selectedKeyId.value = ''
+  keysError.value = ''
   isLoadingKeys.value = true
   try {
-    upstreamKeys.value = await listUpstreamKeys(rate.siteId, rate.groupId ?? '', rate.groupName)
-  } catch {
-    upstreamKeys.value = []
+    const items = await listUpstreamKeys(rate.siteId, rate.groupId ?? '', rate.groupName)
+    if (epoch === connectorEpoch && request === keysRequest) upstreamKeys.value = items
+  } catch (error) {
+    if (epoch === connectorEpoch && request === keysRequest) keysError.value = t(connectionErrorKey(error, 'admin.groupRates.connect.keysFailed'))
   } finally {
-    isLoadingKeys.value = false
+    if (epoch === connectorEpoch && request === keysRequest) isLoadingKeys.value = false
   }
 }
 
@@ -576,15 +646,15 @@ const submitBind = async () => {
       upstreamKeyId: selectedKey.id,
       upstreamKey: selectedKey.key,
       ownGroupIds: [selectedAdminGroupId.value],
-      groupType: selectedGroupType.value,
+      groupType: effectiveGroupType.value,
       adminGroupId: selectedAdminGroupId.value,
       adminResourceId: selectedAdminResourceId.value,
       addToPricingMapping: addToPricingMapping.value,
       operationId: connectOperationId.value,
     })
     closeConnector()
-  } catch {
-    realConnectError.value = t('admin.groupRates.connect.bindFailed')
+  } catch (error) {
+    realConnectError.value = t(connectionErrorKey(error, 'admin.groupRates.connect.bindFailed'))
     isActionLoading.value = false
     return
   }
@@ -1077,7 +1147,20 @@ const historyRowKey = (row: GroupRateHistoryRow, index: number): string => (
             </div>
           </div>
 
-          <!-- sub2api admin：分组类型选择（仅在无法自动检测时显示） -->
+          <div v-if="isLoadingMappingOptions" class="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 class="h-4 w-4 animate-spin" />{{ t('admin.groupRates.connect.mappingOptionsLoading') }}
+          </div>
+          <div v-else-if="mappingOptionsError" role="alert" class="space-y-2 text-sm text-warning">
+            <p>{{ mappingOptionsError }}</p>
+            <Button type="button" variant="secondary" @click="retryMappingOptions">{{ t('admin.groupRates.connect.reload') }}</Button>
+          </div>
+
+          <div v-else-if="connectMode === 'real' && creationCapabilitiesError" role="alert" class="space-y-2 text-sm text-warning">
+            <p>{{ creationCapabilitiesError }}</p>
+            <Button type="button" variant="secondary" @click="retryMappingOptions">{{ t('admin.groupRates.connect.reload') }}</Button>
+          </div>
+
+          <!-- New API 的厂商推断仅作默认值，实际创建协议由用户确认。 -->
           <div v-if="needsGroupTypeSelection" class="space-y-2">
             <span class="text-sm font-medium text-foreground">{{ t('admin.groupRates.connect.groupTypeLabel') }}</span>
             <div class="relative">
@@ -1087,10 +1170,7 @@ const historyRowKey = (row: GroupRateHistoryRow, index: number): string => (
                 :disabled="isActionLoading"
               >
                 <option value="">{{ t('admin.groupRates.connect.groupTypePlaceholder') }}</option>
-                <option value="openai">{{ t('admin.groupRates.connect.groupTypeOpenai') }}</option>
-                <option value="anthropic">{{ t('admin.groupRates.connect.groupTypeAnthropic') }}</option>
-                <option value="gemini">{{ t('admin.groupRates.connect.groupTypeGemini') }}</option>
-                <option value="antigravity">{{ t('admin.groupRates.connect.groupTypeAntigravity') }}</option>
+                <option v-for="option in groupTypeOptions" :key="option.id" :value="option.id">{{ option.name }}</option>
               </select>
               <div class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground">
                 <ChevronDown class="h-3.5 w-3.5" />
@@ -1116,11 +1196,15 @@ const historyRowKey = (row: GroupRateHistoryRow, index: number): string => (
             </div>
           </div>
 
-          <div v-if="connectMode === 'bind'" class="space-y-2">
+          <div v-if="connectMode === 'bind' && !isLoadingMappingOptions && !mappingOptionsError" class="space-y-2">
             <span class="text-sm font-medium text-foreground">{{ t('admin.groupRates.connect.bindSelectKey') }}</span>
             <div v-if="isLoadingKeys" class="flex items-center justify-center py-6 text-muted-foreground">
               <Loader2 class="mr-2 h-4 w-4 animate-spin" />
               {{ t('admin.groupRates.connect.bindKeysLoading') }}
+            </div>
+            <div v-else-if="keysError" role="alert" class="space-y-2 text-sm text-warning">
+              <p>{{ keysError }}</p>
+              <Button type="button" variant="secondary" @click="connectingRate && loadUpstreamKeys(connectingRate)">{{ t('admin.groupRates.connect.reload') }}</Button>
             </div>
             <div v-else-if="upstreamKeys.length === 0" class="px-4 py-6 text-center text-sm text-muted-foreground">
               {{ t('admin.groupRates.connect.bindKeysEmpty') }}
@@ -1163,7 +1247,7 @@ const historyRowKey = (row: GroupRateHistoryRow, index: number): string => (
             </div>
           </div>
 
-          <div v-if="connectMode === 'bind'" class="space-y-2">
+          <div v-if="connectMode === 'bind' && !isLoadingMappingOptions && !mappingOptionsError" class="space-y-2">
             <label for="existing-admin-group" class="flex items-center gap-2 text-sm font-medium text-foreground">
               <ServerCog class="h-4 w-4 text-primary" />
               {{ t('admin.groupRates.connect.bindSelectAdminGroup') }}
@@ -1194,6 +1278,10 @@ const historyRowKey = (row: GroupRateHistoryRow, index: number): string => (
               <Loader2 class="mr-2 h-4 w-4 animate-spin" />
               {{ t('admin.groupRates.connect.adminResourcesLoading') }}
             </div>
+            <div v-else-if="adminResourcesError" role="alert" class="space-y-2 text-sm text-warning">
+              <p>{{ adminResourcesError }}</p>
+              <Button type="button" variant="secondary" @click="loadAdminResourcesForGroup(selectedAdminGroupId)">{{ t('admin.groupRates.connect.reload') }}</Button>
+            </div>
             <div v-else-if="adminResources.length === 0" class="rounded-lg border border-dashed border-border/70 px-4 py-6 text-center text-sm text-muted-foreground">
               {{ t('admin.groupRates.connect.adminResourcesEmpty') }}
             </div>
@@ -1222,7 +1310,7 @@ const historyRowKey = (row: GroupRateHistoryRow, index: number): string => (
             </div>
           </div>
 
-          <div v-if="connectMode === 'real'" class="space-y-2">
+          <div v-if="connectMode === 'real' && !isLoadingMappingOptions && !mappingOptionsError && !creationCapabilitiesError" class="space-y-2">
             <span class="text-sm font-medium text-foreground">{{ t('admin.groupRates.connect.ownGroupLabel') }}</span>
             <div class="max-h-48 overflow-auto rounded-xl border border-border/50 bg-surface divide-y divide-border/30">
               <label

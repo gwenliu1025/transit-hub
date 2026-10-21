@@ -559,7 +559,7 @@ func newAPIChannelTypeName(channelType int) string {
 
 func connectionCapabilities(platform upstream.Platform) *ConnectionCapabilities {
 	if platform != upstream.PlatformNewAPI {
-		return &ConnectionCapabilities{Mode: "account", RequiresGroupType: true}
+		return &ConnectionCapabilities{Mode: "account", RequiresGroupType: true, GroupTypes: accountGroupTypeOptions()}
 	}
 	ids := make([]int, 0, len(newAPIChannelTypeNames))
 	for id := range newAPIChannelTypeNames {
@@ -878,7 +878,7 @@ func stringsToInts(ss []string) ([]int, error) {
 }
 
 // buildAccountPayload 按分组类型组装 admin 站点创建转发账号的请求体。
-// 不同类型有不同的 platform、extra、credentials 配置，详见计划文档中的类型表。
+// 协议载荷与公开能力共用 accountProtocols，避免选择项与实际创建规则分叉。
 func buildAccountPayload(groupType, baseURL, apiKey string, ownGroupIDs []int, accountName string) map[string]any {
 	credentials := map[string]any{
 		"base_url": baseURL,
@@ -893,26 +893,19 @@ func buildAccountPayload(groupType, baseURL, apiKey string, ownGroupIDs []int, a
 		"group_ids":   ownGroupIDs,
 	}
 
-	switch strings.ToLower(groupType) {
-	case "openai":
-		payload["platform"] = "openai"
-		credentials["pool_mode"] = true
-		payload["extra"] = map[string]any{"openai_passthrough": true}
-		payload["concurrency"] = 1000
-	case "anthropic":
-		payload["platform"] = "anthropic"
-		credentials["pool_mode"] = true
-		payload["extra"] = map[string]any{"anthropic_passthrough": true}
-		payload["concurrency"] = 1000
-	case "gemini":
-		payload["platform"] = "gemini"
-		credentials["pool_mode"] = true
-		credentials["tier_id"] = "aistudio_free"
-		payload["concurrency"] = 1000
-	case "antigravity":
-		payload["platform"] = "antigravity"
-		payload["concurrency"] = 10
-	default:
+	if protocol, ok := findAccountProtocol(groupType); ok {
+		payload["platform"] = protocol.ID
+		payload["concurrency"] = protocol.concurrency
+		if protocol.poolMode {
+			credentials["pool_mode"] = true
+		}
+		if protocol.passthrough != "" {
+			payload["extra"] = map[string]any{protocol.passthrough: true}
+		}
+		if protocol.tier != "" {
+			credentials["tier_id"] = protocol.tier
+		}
+	} else {
 		payload["platform"] = groupType
 		payload["concurrency"] = 100
 	}
