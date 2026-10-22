@@ -425,6 +425,7 @@ export default {
       },
       delta: {
         vsPrev: '较前一日',
+        missingYesterday: '缺少昨日数据',
         percentagePoints: '{value} 个百分点'
       },
       common: {
@@ -433,6 +434,7 @@ export default {
       performance: {
         title: '经营表现',
         subtitle: '按北京时间统计本周（周一至今）或本月（1 日至今）的营收、成本与净利润',
+        incomplete: '数据不完整',
         periodRevenue: '周期营收',
         periodCost: '周期成本',
         periodProfit: '周期净利润',

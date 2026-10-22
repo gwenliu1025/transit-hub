@@ -41,17 +41,19 @@ type refreshWorkspace struct {
 // 站点运行时状态缓存在 Redis（通过 SiteCache），PostgreSQL 负责持久化。
 // 当系统设置开启了数据刷新频率时，定时器按配置的间隔自动同步各站点。
 type Service struct {
-	platformService *PlatformService
-	snapshotWriter  SnapshotWriter
-	repository      SiteRepository
-	cache           SiteCache
-	accounts        AdminAccountResolver
-	refreshConfigs  map[refreshWorkspace]RefreshConfig
-	legacyConfig    *RefreshConfig
-	timers          map[string]*time.Timer
-	timerWorkspaces map[string]refreshWorkspace
-	deletedSites    map[string]struct{}
-	mu              sync.Mutex
+	platformService   *PlatformService
+	snapshotWriter    SnapshotWriter
+	repository        SiteRepository
+	cache             SiteCache
+	accounts          AdminAccountResolver
+	refreshConfigs    map[refreshWorkspace]RefreshConfig
+	legacyConfig      *RefreshConfig
+	timers            map[string]*time.Timer
+	timerWorkspaces   map[string]refreshWorkspace
+	deletedSites      map[string]struct{}
+	mu                sync.Mutex
+	configGenerations map[refreshWorkspace]uint64
+	cacheEpoch        uint64
 	// AfterSync 在站点同步成功后被调用，传入同步前后的指标数据。
 	// 由系统设置模块注入，用于余额预警和倍率变更检测。
 	AfterSync func(ctx context.Context, userID, adminAccountID, siteID, siteName string, oldMetrics, newMetrics Metrics)
@@ -144,6 +146,10 @@ func (s *Service) RestoreSavedSites(ctx context.Context) error {
 		return nil
 	}
 
+	// 恢复会改变全量采集基线，日结必须拒绝跨越此次重建。
+	s.mu.Lock()
+	s.cacheEpoch++
+	defer s.mu.Unlock()
 	// 清空 Redis 旧数据，防止残留 key 与数据库不一致。
 	if err := s.cache.Flush(ctx); err != nil {
 		return err
@@ -154,8 +160,6 @@ func (s *Service) RestoreSavedSites(ctx context.Context) error {
 		return err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i := range sites {
 		if strings.TrimSpace(sites[i].UserID) == "" {
 			continue
@@ -443,7 +447,7 @@ func (s *Service) Create(ctx context.Context, userID string, dto CreateRequest) 
 		return Response{}, err
 	}
 	if err := s.saveSite(ctx, site); err != nil {
-		_ = s.cache.Delete(ctx, id, userID)
+		_ = s.deleteCachedSite(ctx, id, userID)
 		return Response{}, err
 	}
 
@@ -894,7 +898,7 @@ func (s *Service) Remove(ctx context.Context, userID string, id string) error {
 	s.mu.Unlock()
 
 	removedSite := *site
-	if err := s.cache.Delete(ctx, id, userID); err != nil {
+	if err := s.deleteCachedSite(ctx, id, userID); err != nil {
 		return err
 	}
 
@@ -924,7 +928,12 @@ func (s *Service) CleanupDeletedWorkspaceSites(ctx context.Context, userID strin
 	}
 
 	s.mu.Lock()
+	// 工作区被删除后释放其配置版本；epoch 防止正在采集的旧版本因删除重置而被接受。
+	s.cacheEpoch++
 	for _, id := range ids {
+		if site, err := s.cache.Get(ctx, id); err == nil && site != nil {
+			delete(s.configGenerations, refreshWorkspace{userID: site.UserID, adminAccountID: site.AdminAccountID})
+		}
 		s.deletedSites[id] = struct{}{}
 		s.clearTimerLocked(id)
 	}
@@ -932,7 +941,7 @@ func (s *Service) CleanupDeletedWorkspaceSites(ctx context.Context, userID strin
 
 	var errs []error
 	for _, id := range ids {
-		if err := s.cache.Delete(ctx, id, userID); err != nil {
+		if err := s.deleteCachedSite(ctx, id, userID); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1140,7 +1149,9 @@ func (s *Service) saveSite(ctx context.Context, site *Site) error {
 	if s.repository == nil || site == nil {
 		return nil
 	}
-	if s.isSiteDeleted(site.ID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, deleted := s.deletedSites[site.ID]; deleted {
 		return newRequestError(ErrorNotFound, "")
 	}
 	ctx, cancel := context.WithTimeout(ctx, persistenceTimeout)
@@ -1157,6 +1168,14 @@ func (s *Service) setCachedSite(ctx context.Context, site *Site) error {
 	if _, deleted := s.deletedSites[site.ID]; deleted {
 		return newRequestError(ErrorNotFound, "")
 	}
+	previous, err := s.cache.Get(ctx, site.ID)
+	if err != nil {
+		return err
+	}
+	if !samePurchaseConfig(previous, site) {
+		s.bumpConfigLocked(previous)
+		s.bumpConfigLocked(site)
+	}
 	return s.cache.Set(ctx, site)
 }
 
@@ -1171,6 +1190,8 @@ func (s *Service) deleteSite(ctx context.Context, userID string, id string) erro
 	if s.repository == nil {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, persistenceTimeout)
 	defer cancel()
 	return s.repository.DeleteSite(ctx, userID, id)

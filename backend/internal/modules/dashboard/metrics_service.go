@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -27,15 +29,35 @@ type UpstreamLister interface {
 	BalanceBreakdown(ctx context.Context, userID string) ([]upstream.BalanceBreakdownItem, error)
 }
 
+// MetricsStore 保持日结与实时采样共用一个数据库写入契约，便于独立验证失败边界。
+type MetricsStore interface {
+	Upsert(context.Context, DailySnapshot) error
+	ListRange(context.Context, string, string, int) ([]DailySnapshot, error)
+	GetBalanceFilter(context.Context, string, string) (BalanceFilterConfig, error)
+	SaveBalanceFilter(context.Context, BalanceFilterConfig) error
+}
+
+type dailyRevenueSource interface {
+	FetchAdminUsageStatsContext(context.Context, upstream.Session, string, string) (float64, error)
+}
+
+type dailyPurchaseSource interface {
+	WithDailyPurchaseForAccount(context.Context, string, string, string, func(context.Context, float64) error) error
+}
+
+var _ dailyRevenueSource = (*upstream.PlatformService)(nil)
+var _ dailyPurchaseSource = (*upstream.Service)(nil)
+
 // MetricsService 负责仪表盘指标的实时计算、历史快照存储与午夜调度。
 // 与同包的 Service（admin 会话管理）职责分离，共享 SessionStore 和 PlatformClient。
 type MetricsService struct {
 	store       SessionStore
 	platform    PlatformClient
 	upstreams   UpstreamLister
-	metricsRepo *MetricsRepository
+	metricsRepo MetricsStore
 	accounts    AdminAccountService
 	sessionSync MySiteStateSync
+	now         func() time.Time
 }
 
 var beijingLocation = func() *time.Location {
@@ -89,8 +111,27 @@ func (s *MetricsService) freshAdminSession(ctx context.Context, userID string, a
 	return refreshed, nil
 }
 
-func NewMetricsService(store SessionStore, platform PlatformClient, upstreams UpstreamLister, metricsRepo *MetricsRepository, accounts AdminAccountService) *MetricsService {
+func NewMetricsService(store SessionStore, platform PlatformClient, upstreams UpstreamLister, metricsRepo MetricsStore, accounts AdminAccountService) *MetricsService {
 	return &MetricsService{store: store, platform: platform, upstreams: upstreams, metricsRepo: metricsRepo, accounts: accounts}
+}
+
+func (s *MetricsService) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+func (s *MetricsService) revenue(ctx context.Context, session upstream.Session, date string) (float64, error) {
+	source, ok := s.platform.(dailyRevenueSource)
+	if !ok {
+		return 0, errors.New("dashboard daily revenue source unavailable")
+	}
+	value, err := source.FetchAdminUsageStatsContext(ctx, session, date, date)
+	if err == nil {
+		err = ctx.Err()
+	}
+	return value, err
 }
 
 // LiveMetrics 实时计算五项核心指标并返回。
@@ -103,6 +144,8 @@ func NewMetricsService(store SessionStore, platform PlatformClient, upstreams Up
 //   - upstreamBalance: 所有上游站点余额 × 站点倍率之和（复用已同步的内存数据）
 //   - netProfit:       todayProfit - todayPurchase
 func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (MetricsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
 	// 获取并校验 admin 会话（平台感知：sub2api 检查 AccessToken，new-api 检查 Cookie+UserID）。
 	adminAccountID, err := s.requireCurrentAdminAccount(ctx, userID)
 	if err != nil {
@@ -128,8 +171,8 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 	}
 
 	// 并行获取四项独立数据：今日盈利、站点余额、分组数量、上游指标。
-	// 各 goroutine 出错只记日志、降级为零值，不阻塞整体返回。
-	today := beijingMetricDate(time.Now())
+	// 营收失败必须返回错误，防止零值污染持久化；其它实时读取保留既有口径。
+	today := beijingMetricDate(s.clock())
 	var (
 		todayProfit     float64
 		siteBalance     float64
@@ -137,14 +180,17 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 		todayPurchase   float64
 		upstreamBalance float64
 		wg              sync.WaitGroup
+		revenueErr      error
+		balanceRecorded bool
 	)
 
 	// goroutine 1: 今日盈利额度（平台中性）。
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		profit, err := s.platform.FetchAdminUsageStats(session, today, today)
+		profit, err := s.revenue(ctx, session, today)
 		if err != nil {
+			revenueErr = err
 			log.Printf("dashboard metrics: fetch usage stats failed user_id=%s err=%v", userID, err)
 			return
 		}
@@ -169,6 +215,7 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 			return
 		}
 		siteBalance = balanceResult.Balance
+		balanceRecorded = true
 	}()
 
 	// goroutine 3: 管理员站点分组数量（平台中性）。
@@ -192,6 +239,15 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 	}()
 
 	wg.Wait()
+	if revenueErr != nil {
+		return MetricsResponse{}, revenueErr
+	}
+	if err := ctx.Err(); err != nil {
+		return MetricsResponse{}, err
+	}
+	if beijingMetricDate(s.clock()) != today {
+		return MetricsResponse{}, ErrSnapshotNotWritten
+	}
 
 	netProfit := todayProfit - todayPurchase
 
@@ -204,9 +260,10 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 		GroupCount:      groupCount,
 	}
 
-	// 将当天指标 upsert 到数据库，即使部分指标获取失败也保存已有数据，
-	// 后续调用会用更完整的数据覆盖。
-	s.upsertSnapshot(ctx, userID, adminAccountID, today, result)
+	// 营收源失败或请求跨日时不写日内采样；数据库还会复查真正执行时的日期。
+	if err := s.upsertSnapshot(ctx, userID, adminAccountID, today, result, balanceRecorded); err != nil {
+		return MetricsResponse{}, err
+	}
 
 	return result, nil
 }
@@ -229,33 +286,30 @@ func (s *MetricsService) Trends(ctx context.Context, userID string, days int) (T
 	points := make([]TrendPoint, 0, len(snapshots))
 	for _, snap := range snapshots {
 		points = append(points, TrendPoint{
-			Date:            snap.Date.Format("2006-01-02"),
-			TodayProfit:     snap.TodayProfit,
-			SiteBalance:     snap.SiteBalance,
-			TodayPurchase:   snap.TodayPurchase,
-			NetProfit:       snap.NetProfit,
-			UpstreamBalance: snap.UpstreamBalance,
+			RevenueComplete:  snap.RevenueComplete,
+			PurchaseComplete: snap.PurchaseComplete,
+			BalanceRecorded:  snap.BalanceRecorded,
+			Date:             snap.Date.Format("2006-01-02"),
+			TodayProfit:      snap.TodayProfit,
+			SiteBalance:      snap.SiteBalance,
+			TodayPurchase:    snap.TodayPurchase,
+			NetProfit:        snap.NetProfit,
+			UpstreamBalance:  snap.UpstreamBalance,
 		})
 	}
 	return TrendResponse{Points: points}, nil
 }
 
-// StartScheduler 启动午夜快照调度协程。
-// 每天午夜（Asia/Shanghai 时区）为所有活跃 admin 用户保存当天的指标快照，
-// 确保即使用户当天未访问仪表盘，趋势图也不会出现空缺。
+// StartScheduler 启动时仅修复昨日营收；计划日结按当时冻结配置结算昨日成本。
 func (s *MetricsService) StartScheduler(ctx context.Context) {
 	go func() {
-		loc, err := time.LoadLocation("Asia/Shanghai")
-		if err != nil {
-			log.Printf("dashboard scheduler: failed to load Asia/Shanghai timezone, using UTC: %v", err)
-			loc = time.UTC
+		if err := s.reconcileAll(ctx, false); err != nil {
+			log.Printf("dashboard startup reconciliation failed: %v", err)
 		}
-
 		for {
-			now := time.Now().In(loc)
-			nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, loc)
-			timer := time.NewTimer(time.Until(nextMidnight))
-
+			now := s.clock().In(beijingLocation)
+			next := nextSettlementTime(now)
+			timer := time.NewTimer(next.Sub(now))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -267,87 +321,149 @@ func (s *MetricsService) StartScheduler(ctx context.Context) {
 	}()
 }
 
-// snapshotAll 遍历所有活跃 admin 用户，为昨天的日期保存指标快照。
-// 午夜执行时，"今天"已经翻到新的一天，因此用昨天的日期查询 sub2api 的 usage stats，
-// 而上游站点的余额取当前值（余额不按天重置）。
-// 单用户出错只记日志，不影响其他用户和调度循环（与 refreshDueSessions 相同的容错模式）。
-//
-// 注意：此方法是后台调度路径，使用 ListForAccount 显式传入 adminAccountID，
-// 不依赖当前工作区上下文（避免 fail-closed 的 List 在无 workspace 上下文时返回空）。
-func (s *MetricsService) snapshotAll(ctx context.Context) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("dashboard scheduler panic recovered: %v", r)
-		}
-	}()
+// 日志聚合存在落库水位，避开整点尚未收敛的窗口；启动补偿使用同一边界。
+func nextSettlementTime(now time.Time) time.Time {
+	now = now.In(beijingLocation)
+	next := time.Date(now.Year(), now.Month(), now.Day(), 0, 5, 0, 0, beijingLocation)
+	if !next.After(now) {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
+}
 
+func settlementWindowReady(now time.Time) bool {
+	now = now.In(beijingLocation)
+	return now.Hour() > 0 || now.Minute() >= 5
+}
+
+func (s *MetricsService) snapshotAll(ctx context.Context) {
+	if err := s.reconcileAll(ctx, true); err != nil {
+		log.Printf("dashboard daily settlement failed: %v", err)
+	}
+}
+
+func (s *MetricsService) reconcileAll(ctx context.Context, purchase bool) error {
+	if !settlementWindowReady(s.clock()) {
+		return nil
+	}
+	// 单批次和单工作区都有限时；一次失败不会无限重试或切到其它身份。
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
 	refs, err := s.store.ActiveSessions(ctx)
 	if err != nil {
-		log.Printf("dashboard scheduler: list active users failed: %v", err)
-		return
+		return err
 	}
-
-	yesterday := previousBeijingMetricDate(time.Now())
-
+	date := previousBeijingMetricDate(s.clock())
+	var failures []error
 	for _, ref := range refs {
-		userID := ref.UserID
-		adminAccountID := ref.AdminAccountID
-		yesterdayDate, _ := time.Parse("2006-01-02", yesterday)
-		exists, err := s.metricsRepo.Exists(ctx, userID, adminAccountID, yesterdayDate)
-		if err != nil {
-			log.Printf("dashboard scheduler: check exists failed user_id=%s err=%v", userID, err)
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
+		if err := s.reconcileDate(ctx, ref.UserID, ref.AdminAccountID, date, purchase); err != nil {
+			failures = append(failures, fmt.Errorf("workspace %s/%s: %w", ref.UserID, ref.AdminAccountID, err))
 			continue
 		}
-		// 如果昨天的快照已存在（由白天的 LiveMetrics 调用写入），跳过该用户。
-		if exists {
-			continue
-		}
-
-		record, err := s.store.Get(ctx, userID, adminAccountID)
-		if err != nil || record == nil || !record.Session.IsAuthenticated() {
-			continue
-		}
-
-		session, err := s.freshAdminSession(ctx, userID, adminAccountID, record)
-		if err != nil {
-			log.Printf("dashboard scheduler: refresh session failed user_id=%s err=%v", userID, err)
-			continue
-		}
-
-		// 昨日盈利（平台中性）。
-		todayProfit, err := s.platform.FetchAdminUsageStats(session, yesterday, yesterday)
-		if err != nil {
-			log.Printf("dashboard scheduler: fetch usage stats failed user_id=%s err=%v", userID, err)
-			todayProfit = 0
-		}
-
-		// 站点用户总余额（平台中性）。
-		var siteBalance float64
-		filterCfg, _ := s.metricsRepo.GetBalanceFilter(ctx, userID, adminAccountID)
-		if result, err := s.platform.FetchAdminSiteBalanceFiltered(session, upstream.BalanceFilter{
-			ExcludeAdmin:    filterCfg.ExcludeAdmin,
-			ExcludeBalances: filterCfg.ExcludeBalances,
-		}); err == nil {
-			siteBalance = result.Balance
-		}
-
-		// 上游指标：使用 ListForAccount 显式传入 adminAccountID，
-		// 确保后台调度路径不依赖当前工作区上下文。
-		todayPurchase, upstreamBalance := aggregateUpstreamMetricsForDate(
-			s.upstreams.ListForAccount(ctx, userID, adminAccountID),
-			yesterday,
-		)
-
-		result := MetricsResponse{
-			TodayProfit:     todayProfit,
-			SiteBalance:     siteBalance,
-			TodayPurchase:   todayPurchase,
-			NetProfit:       todayProfit - todayPurchase,
-			UpstreamBalance: upstreamBalance,
-		}
-		s.upsertSnapshot(ctx, userID, adminAccountID, yesterday, result)
-		log.Printf("dashboard scheduler: snapshot saved user_id=%s admin_account_id=%s date=%s", userID, adminAccountID, yesterday)
+		log.Printf("dashboard reconciliation saved user_id=%s admin_account_id=%s date=%s purchase=%t", ref.UserID, ref.AdminAccountID, date, purchase)
 	}
+	return errors.Join(failures...)
+}
+
+// ReconcileRevenue 仅从仍有完整日志的真实昨日恢复营收，不将今天倍率追溯应用于历史成本。
+// 工作区归属由会话读取和数据库写入共同约束；调用方负责枚举已核对的补数范围。
+func (s *MetricsService) ReconcileRevenue(ctx context.Context, userID, adminAccountID, date string) error {
+	if date != previousBeijingMetricDate(s.clock()) || !settlementWindowReady(s.clock()) {
+		return errors.New("dashboard revenue source only supports settled yesterday")
+	}
+	return s.reconcileDate(ctx, userID, adminAccountID, date, false)
+}
+
+// ApplyVerifiedRevenue 接收调用方已核对覆盖范围与完整性的权威日汇总。
+// 此内部入口不查询有保留期的日志，也不补写历史成本或余额；不注册 HTTP 路由。
+func (s *MetricsService) ApplyVerifiedRevenue(ctx context.Context, userID, adminAccountID, date string, amount float64) error {
+	parsed, err := time.ParseInLocation("2006-01-02", date, beijingLocation)
+	if err != nil || date >= beijingMetricDate(s.clock()) || userID == "" || adminAccountID == "" || math.IsNaN(amount) || math.IsInf(amount, 0) || amount < 0 {
+		return errors.New("dashboard verified revenue requires historical date, workspace and finite nonnegative amount")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	id, err := metricsRandomID()
+	if err != nil {
+		return err
+	}
+	return s.metricsRepo.Upsert(ctx, DailySnapshot{ID: id, UserID: userID, AdminAccountID: adminAccountID, Date: parsed, TodayProfit: amount, RevenueComplete: true, CreatedAt: s.clock()})
+}
+
+func (s *MetricsService) reconcileDate(ctx context.Context, userID, adminAccountID, date string, purchase bool) error {
+	parsed, err := time.ParseInLocation("2006-01-02", date, beijingLocation)
+	if err != nil || date >= beijingMetricDate(s.clock()) || userID == "" || adminAccountID == "" {
+		return errors.New("dashboard reconciliation requires a historical date and workspace")
+	}
+	if purchase && date != previousBeijingMetricDate(s.clock()) {
+		return errors.New("dashboard purchase settlement requires yesterday")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	id, err := metricsRandomID()
+	if err != nil {
+		return err
+	}
+	snapshot := DailySnapshot{ID: id, UserID: userID, AdminAccountID: adminAccountID, Date: parsed, CreatedAt: s.clock()}
+	var failures []error
+	record, err := s.store.Get(ctx, userID, adminAccountID)
+	if err == nil && (record == nil || !record.Session.IsAuthenticated()) {
+		err = requestError(ErrorAdminOnly)
+	}
+	if err == nil {
+		// 日结只消费当前会话，刷新与持久化仍归既有会话 owner。
+		snapshot.TodayProfit, err = s.revenue(ctx, record.Session, date)
+	}
+	if err != nil {
+		failures = append(failures, fmt.Errorf("revenue: %w", err))
+	} else {
+		snapshot.RevenueComplete = true
+	}
+	if purchase {
+		source, ok := s.upstreams.(dailyPurchaseSource)
+		consumed := false
+		if !ok {
+			err = errors.New("dashboard daily purchase source unavailable")
+		} else {
+			err = source.WithDailyPurchaseForAccount(ctx, userID, adminAccountID, date, func(commitCtx context.Context, amount float64) error {
+				// 配置 owner 在此回调返回前保持冻结；日结唯一写入必须发生在其锁内。
+				consumed = true
+				if err := commitCtx.Err(); err != nil {
+					return err
+				}
+				snapshot.TodayPurchase = amount
+				snapshot.PurchaseComplete = true
+				if err := s.metricsRepo.Upsert(commitCtx, snapshot); err != nil {
+					return fmt.Errorf("persist: %w", err)
+				}
+				return nil
+			})
+		}
+		if consumed {
+			// 提交失败或接受状态未知时不再写一遍部分营收，避免隐式重试掩盖原错误。
+			if err != nil {
+				failures = append(failures, err)
+			}
+			return errors.Join(failures...)
+		}
+		if err == nil {
+			err = errors.New("dashboard daily purchase source did not provide a result")
+		}
+		failures = append(failures, fmt.Errorf("purchase: %w", err))
+	}
+
+	if err := ctx.Err(); err != nil {
+		return errors.Join(append(failures, err)...)
+	}
+	if snapshot.RevenueComplete || snapshot.PurchaseComplete {
+		if err := s.metricsRepo.Upsert(ctx, snapshot); err != nil {
+			failures = append(failures, fmt.Errorf("persist: %w", err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func aggregateUpstreamMetricsForDate(sites []upstream.Response, targetDate string) (todayPurchase, upstreamBalance float64) {
@@ -380,18 +496,15 @@ func syncedOnBeijingDate(lastSyncedAt *int64, targetDate string) bool {
 	return time.UnixMilli(*lastSyncedAt).In(beijingLocation).Format("2006-01-02") == targetDate
 }
 
-// upsertSnapshot 将指标写入 dashboard_daily_stats 表。
-// 冲突时更新已有行，保证同一天内多次调用始终保留最新数据。
-func (s *MetricsService) upsertSnapshot(ctx context.Context, userID, adminAccountID, date string, metrics MetricsResponse) {
+// upsertSnapshot 提交日内采样，数据库负责日期门禁与已完成字段保护。
+func (s *MetricsService) upsertSnapshot(ctx context.Context, userID, adminAccountID, date string, metrics MetricsResponse, balanceRecorded bool) error {
 	parsedDate, err := time.Parse("2006-01-02", date)
 	if err != nil {
-		log.Printf("dashboard metrics: invalid date %s: %v", date, err)
-		return
+		return err
 	}
 	id, err := metricsRandomID()
 	if err != nil {
-		log.Printf("dashboard metrics: generate id failed: %v", err)
-		return
+		return err
 	}
 	snapshot := DailySnapshot{
 		ID:              id,
@@ -403,11 +516,10 @@ func (s *MetricsService) upsertSnapshot(ctx context.Context, userID, adminAccoun
 		TodayPurchase:   metrics.TodayPurchase,
 		NetProfit:       metrics.NetProfit,
 		UpstreamBalance: metrics.UpstreamBalance,
-		CreatedAt:       time.Now(),
+		CreatedAt:       s.clock(),
+		BalanceRecorded: balanceRecorded,
 	}
-	if err := s.metricsRepo.Upsert(ctx, snapshot); err != nil {
-		log.Printf("dashboard metrics: upsert snapshot failed user_id=%s date=%s err=%v", userID, date, err)
-	}
+	return s.metricsRepo.Upsert(ctx, snapshot)
 }
 
 // AdminGroups 获取管理员站点的所有分组列表（平台中性）。

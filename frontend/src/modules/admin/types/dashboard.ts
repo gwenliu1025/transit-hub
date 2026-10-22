@@ -19,7 +19,8 @@ export type DashboardColorToken = 'primary' | 'accent' | 'signal' | 'warning'
 export interface TrendPoint {
   /** X 轴标签，使用与语言无关的日期格式，如 "6/27"。 */
   label: string
-  value: number
+  /** null 表示当天缺失或尚未确认，图表不得补零。 */
+  value: number | null
 }
 
 /** 同一指标在不同周期下的连续序列。 */
@@ -34,7 +35,7 @@ export interface DashboardMetricData {
   color: DashboardColorToken
   /** 当前值（“今天”的数值），即月序列最后一个点。 */
   current: number
-  /** 日对比使用的最后两个有效点，不随自然周或自然月截断。 */
-  comparison: TrendPoint[]
+  /** 北京时间昨日与今日的日对比；昨日缺失或未确认时仅含今日，不随自然周或自然月截断。 */
+  comparison: (TrendPoint & { value: number })[]
   series: MetricSeries
 }

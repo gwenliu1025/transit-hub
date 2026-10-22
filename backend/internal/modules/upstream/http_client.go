@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -43,6 +44,11 @@ func NewHTTPClient(client *http.Client) *HTTPClient {
 }
 
 func (c *HTTPClient) requestJSON(reqURL string, options requestOptions) (jsonResponse, error) {
+	return c.requestJSONContext(context.Background(), reqURL, options)
+}
+
+// requestJSONContext 将调用方取消和截止时间传入既有 egress 客户端。
+func (c *HTTPClient) requestJSONContext(ctx context.Context, reqURL string, options requestOptions) (jsonResponse, error) {
 	method := options.Method
 	if method == "" {
 		method = http.MethodGet
@@ -53,7 +59,7 @@ func (c *HTTPClient) requestJSON(reqURL string, options requestOptions) (jsonRes
 		return jsonResponse{}, err
 	}
 
-	req, err := http.NewRequest(method, reqURL, body)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
 	if err != nil {
 		return jsonResponse{}, newRequestError(ErrorInvalidURL, "")
 	}
@@ -83,6 +89,9 @@ func (c *HTTPClient) requestJSON(reqURL string, options requestOptions) (jsonRes
 
 	response, err := c.client.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return jsonResponse{}, ctx.Err()
+		}
 		log.Printf("[http-client] 请求失败 url=%s err=%v", reqURL, err)
 		return jsonResponse{}, newRequestError(ErrorNetwork, "")
 	}
@@ -90,6 +99,9 @@ func (c *HTTPClient) requestJSON(reqURL string, options requestOptions) (jsonRes
 
 	payload, err := parseJSON(response.Body, reqURL)
 	if err != nil {
+		if ctx.Err() != nil {
+			return jsonResponse{}, ctx.Err()
+		}
 		return jsonResponse{}, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {

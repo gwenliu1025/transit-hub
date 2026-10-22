@@ -23,11 +23,25 @@ export function dashboardDate(now = new Date()): string {
   return `${part('year')}-${part('month')}-${part('day')}`
 }
 
-function toSeries(points: DashboardTrendPoint[], key: DashboardMetricKey): TrendPoint[] {
-  return points.map(point => {
-    const [, month, day] = point.date.split('-')
-    return { label: `${Number(month)}/${Number(day)}`, value: point[key] }
-  })
+// 完整性由后端声明；旧响应缺标志时也按未确认处理。
+function confirmedValue(point: DashboardTrendPoint | undefined, key: DashboardMetricKey): number | null {
+  if (!point) return null
+  const complete = key === 'todayProfit' ? point.revenueComplete === true
+    : key === 'todayPurchase' ? point.purchaseComplete === true
+    : key === 'netProfit' ? point.revenueComplete === true && point.purchaseComplete === true
+    : point.balanceRecorded === true
+  return complete && Number.isFinite(point[key]) ? point[key] : null
+}
+
+function dateLabel(date: string): string {
+  const [, month, day] = date.split('-')
+  return `${Number(month)}/${Number(day)}`
+}
+
+// 缺一天即不是完整周期总额，避免把已确认小计冒充总额。
+export function sumDashboardSeries(points: TrendPoint[]): number | null {
+  if (points.length === 0 || points.some(point => point.value === null)) return null
+  return points.reduce((total, point) => total + point.value!, 0)
 }
 
 export function buildDashboardMetrics(
@@ -41,19 +55,33 @@ export function buildDashboardMetrics(
   monday.setUTCDate(monday.getUTCDate() - (monday.getUTCDay() + 6) % 7)
   const weekStart = monday.toISOString().slice(0, 10)
   const monthStart = `${today.slice(0, 7)}-01`
+  const previousDay = new Date(`${today}T00:00:00Z`)
+  previousDay.setUTCDate(previousDay.getUTCDate() - 1)
+  const yesterday = previousDay.toISOString().slice(0, 10)
 
-  // 历史只消费今天之前的快照，今天仅追加一次实时值；缺失日期不虚构为零。
-  const points = trendPoints.filter(point => point.date < today).sort((a, b) => a.date.localeCompare(b.date))
-  points.push({ ...live, date: today })
-  const week = points.filter(point => point.date >= weekStart)
-  const month = points.filter(point => point.date >= monthStart)
+  const history = new Map(trendPoints.filter(point => point.date < today).map(point => [point.date, point]))
+  // 所有指标共用完整自然日轴，缺日保留 null，避免图表错位或把缺口连成真实数据。
+  const dates: string[] = []
+  const cursor = new Date(`${weekStart < monthStart ? weekStart : monthStart}T00:00:00Z`)
+  while (cursor.toISOString().slice(0, 10) <= today) {
+    dates.push(cursor.toISOString().slice(0, 10))
+    cursor.setUTCDate(cursor.getUTCDate() + 1)
+  }
 
-  return METRIC_CONFIGS.map(({ key, color }) => ({
-    key,
-    color,
-    current: live[key],
-    // 日对比继续使用最后两个有效点，月初也保留上月末的数据。
-    comparison: toSeries(points.slice(-2), key),
-    series: { week: toSeries(week, key), month: toSeries(month, key) },
-  }))
+  return METRIC_CONFIGS.map(({ key, color }) => {
+    const previous = confirmedValue(history.get(yesterday), key)
+    const comparison = previous === null ? [] : [{ label: dateLabel(yesterday), value: previous }]
+    comparison.push({ label: dateLabel(today), value: live[key] })
+    const series = (start: string): TrendPoint[] => dates.filter(date => date >= start).map(date => ({
+      label: dateLabel(date),
+      value: date === today ? live[key] : confirmedValue(history.get(date), key),
+    }))
+    return {
+      key,
+      color,
+      current: live[key],
+      comparison,
+      series: { week: series(weekStart), month: series(monthStart) },
+    }
+  })
 }

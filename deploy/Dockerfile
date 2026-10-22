@@ -14,7 +14,8 @@ WORKDIR /src/backend
 COPY backend/go.mod backend/go.sum ./
 RUN go mod download
 COPY backend/ .
-RUN CGO_ENABLED=0 go build -o /out/transithub-api ./cmd/api
+RUN CGO_ENABLED=0 go build -o /out/transithub-api ./cmd/api \
+    && CGO_ENABLED=0 go build -o /out/reconcile-dashboard ./cmd/reconcile-dashboard
 
 # ---- 阶段 3：运行时 ----
 FROM alpine:3.20
@@ -22,6 +23,8 @@ RUN apk add --no-cache ca-certificates tzdata
 RUN mkdir -p /app/data
 
 COPY --from=backend-builder /out/transithub-api /app/transithub-api
+# 受控营收修复复用同版本日结入口，默认仅预演，不随应用启动执行。
+COPY --from=backend-builder /out/reconcile-dashboard /app/reconcile-dashboard
 COPY --from=frontend-builder /src/frontend/dist /app/public
 
 ENV PORT=10621

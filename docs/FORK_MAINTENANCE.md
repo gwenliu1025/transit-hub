@@ -17,7 +17,7 @@
 | 请求/响应预算与工作区调度隔离 | `backend/internal/shared/httpjson/`、`backend/internal/httpserver/server.go`、`settings/`、`upstream/service.go` | 请求/响应上限、`settings/strategy_workspace_test.go`、`upstream/refresh_scheduler_test.go` |
 | 真实对接幂等预留与补偿边界 | `my_sites/connection_service.go`、`repository.go`；迁移 `000019` | `my_sites/connection_idempotency_test.go`、`backend/internal/database/migrations/idempotency_migration_test.go` |
 | New API 对接协议选择与错误边界 | `my_sites/connection_protocol.go`、`connection_service.go`、`handler.go`；前端 `GroupRatesView.vue` 与 `utils/connectionOptions.ts` | `my_sites/connection_protocol_test.go`；`frontend/tests/connections.test.ts`；[修复与验证记录](audits/2026-10-21-newapi-group-connection-fix.md) |
-| 自然周/月经营统计、昨日对比与跨日缓存 | `frontend/src/modules/admin/utils/dashboardMetrics.ts`、`composables/useDashboardMetrics.ts`；后端历史日期查询 | `frontend/tests/dashboardMetrics.test.ts`；`dashboard/metrics_repository_postgres_test.go` |
+| 自然周/月、完整日结、昨日对比与跨日缓存 | `frontend/src/modules/admin/utils/dashboardMetrics.ts`；`dashboard/metrics_service.go`、`metrics_repository.go`；`upstream/daily_usage.go` | `frontend/tests/dashboardMetrics.test.ts`；dashboard日结/真实PG测试；`upstream/daily_usage_test.go`；[修复与恢复边界](audits/2026-10-22-dashboard-daily-settlement.md) |
 | Fork 部署来源与发布版本一致性 | `backend/internal/config/config.go`、`scripts/verify-release.mjs`、`.github/workflows/release.yml` | `node scripts/verify-release.mjs` 与发布工作流 |
 
 早期成本/会话变更见[生产改动迁移清单](audits/2026-08-04-production-change-inventory.md)，安全加固的历史范围与未证明项见[当时的安全验证](audits/2026-08-05-security-hardening-validation.md)，自然周期正式发布见[v0.1.16](releases/v0.1.16.md)。历史日期记录不作为本轮验证通过证明。

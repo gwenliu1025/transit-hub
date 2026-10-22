@@ -20,28 +20,35 @@ type TrendResponse struct {
 
 // TrendPoint 代表一天的指标快照，用于趋势图渲染。
 type TrendPoint struct {
-	Date            string  `json:"date"` // 日期，格式 "2006-01-02"
-	TodayProfit     float64 `json:"todayProfit"`
-	SiteBalance     float64 `json:"siteBalance"`
-	TodayPurchase   float64 `json:"todayPurchase"`
-	NetProfit       float64 `json:"netProfit"`
-	UpstreamBalance float64 `json:"upstreamBalance"`
+	RevenueComplete  bool    `json:"revenueComplete"`
+	PurchaseComplete bool    `json:"purchaseComplete"`
+	BalanceRecorded  bool    `json:"balanceRecorded"`
+	Date             string  `json:"date"` // 日期，格式 "2006-01-02"
+	TodayProfit      float64 `json:"todayProfit"`
+	SiteBalance      float64 `json:"siteBalance"`
+	TodayPurchase    float64 `json:"todayPurchase"`
+	NetProfit        float64 `json:"netProfit"`
+	UpstreamBalance  float64 `json:"upstreamBalance"`
 }
 
 // DailySnapshot 是 dashboard_daily_stats 表的行结构。
 // 每天至多一行（user_id + admin_account_id + date 唯一），
 // 通过 LiveMetrics 调用时的 upsert 和午夜调度器持续更新。
 type DailySnapshot struct {
-	ID              string
-	UserID          string
-	AdminAccountID  string
-	Date            time.Time
-	TodayProfit     float64
-	SiteBalance     float64
-	TodayPurchase   float64
-	NetProfit       float64
-	UpstreamBalance float64
-	CreatedAt       time.Time
+	// 日内采样不证明日结；余额只记录采样时点，不用补数时的当前余额伪造历史。
+	RevenueComplete  bool
+	PurchaseComplete bool
+	BalanceRecorded  bool
+	ID               string
+	UserID           string
+	AdminAccountID   string
+	Date             time.Time
+	TodayProfit      float64
+	SiteBalance      float64
+	TodayPurchase    float64
+	NetProfit        float64
+	UpstreamBalance  float64
+	CreatedAt        time.Time
 }
 
 // AdminGroupsResponse 是 GET /api/dashboard/groups 返回的管理员站点分组数据。

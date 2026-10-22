@@ -90,6 +90,9 @@ export interface DashboardMetricsResponse {
 /** 历史趋势单日数据点。 */
 export interface DashboardTrendPoint {
   date: string
+  revenueComplete: boolean
+  purchaseComplete: boolean
+  balanceRecorded: boolean
   todayProfit: number
   siteBalance: number
   todayPurchase: number

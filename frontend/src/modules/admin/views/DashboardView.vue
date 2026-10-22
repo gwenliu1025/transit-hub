@@ -52,7 +52,7 @@ import type { ConnectionHealthStoredSummary } from '../types/connectionHealth'
 import type { DashboardColorToken, DashboardMetricData, DashboardMetricKey, DashboardPeriod } from '../types/dashboard'
 import type { DashboardAdminPlatform, Sub2apiAuthMethod } from '../types/dashboardAdmin'
 import { computeDelta, formatCny, formatDateTime } from '../utils/dashboard'
-import { dashboardDate } from '../utils/dashboardMetrics'
+import { dashboardDate, sumDashboardSeries } from '../utils/dashboardMetrics'
 
 const { t, locale } = useI18n()
 const router = useRouter()
@@ -264,7 +264,6 @@ const METRIC_META: Record<DashboardMetricKey, { icon: Component; labelKey: strin
 
 const metricMap = computed(() => new Map(metrics.value.map(metric => [metric.key, metric])))
 const metric = (key: DashboardMetricKey): DashboardMetricData | undefined => metricMap.value.get(key)
-const deltaCaption = computed(() => t('admin.dashboard.delta.vsPrev'))
 
 const percentFormatter = computed(() => new Intl.NumberFormat(locale.value, {
   style: 'percent',
@@ -281,7 +280,9 @@ const profitMargin = computed(() => {
 const marginSeries = computed(() => {
   const revenue = metric('todayProfit')?.comparison ?? []
   const profit = metric('netProfit')?.comparison ?? []
-  return revenue.map((point, index) => point.value > 0 ? ((profit[index]?.value ?? 0) / point.value) * 100 : 0)
+  // 收入可单独完整，但利润率必须同时具备昨日收入与净利。
+  if (revenue.length !== 2 || profit.length !== 2) return []
+  return revenue.map((point, index) => point.value > 0 ? (profit[index].value / point.value) * 100 : 0)
 })
 
 interface DashboardCoreCard {
@@ -292,6 +293,7 @@ interface DashboardCoreCard {
   value: string
   deltaDirection: ReturnType<typeof computeDelta>['direction']
   deltaText: string
+  deltaCaption: string
   clickable: boolean
   negativeWhenUp: boolean
 }
@@ -300,6 +302,7 @@ const cards = computed<DashboardCoreCard[]>(() => {
   const result: DashboardCoreCard[] = (['todayProfit', 'todayPurchase', 'netProfit'] as DashboardMetricKey[]).flatMap((key) => {
     const current = metric(key)
     if (!current) return []
+    const hasYesterday = current.comparison.length === 2
     const delta = computeDelta(current.comparison.map(point => point.value))
     return [{
       key,
@@ -308,11 +311,14 @@ const cards = computed<DashboardCoreCard[]>(() => {
       color: METRIC_META[key].color,
       value: formatCny(current.current),
       deltaDirection: delta.direction,
-      deltaText: formatCny(Math.abs(delta.amount)),
+      // 缺昨日时不展示 computeDelta 的占位零值，以免被误读为持平。
+      deltaText: hasYesterday ? formatCny(Math.abs(delta.amount)) : '',
+      deltaCaption: t(hasYesterday ? 'admin.dashboard.delta.vsPrev' : 'admin.dashboard.delta.missingYesterday'),
       clickable: key === 'todayProfit' || key === 'todayPurchase',
       negativeWhenUp: key === 'todayPurchase',
     }]
   })
+  const hasYesterdayMargin = marginSeries.value.length === 2
   const marginDelta = computeDelta(marginSeries.value)
   result.push({
     key: 'profitMargin',
@@ -321,7 +327,8 @@ const cards = computed<DashboardCoreCard[]>(() => {
     color: 'accent',
     value: percentFormatter.value.format(profitMargin.value / 100),
     deltaDirection: marginDelta.direction,
-    deltaText: t('admin.dashboard.delta.percentagePoints', { value: numberFormatter.value.format(Math.abs(marginDelta.amount)) }),
+    deltaText: hasYesterdayMargin ? t('admin.dashboard.delta.percentagePoints', { value: numberFormatter.value.format(Math.abs(marginDelta.amount)) }) : '',
+    deltaCaption: t(hasYesterdayMargin ? 'admin.dashboard.delta.vsPrev' : 'admin.dashboard.delta.missingYesterday'),
     clickable: false,
     negativeWhenUp: false,
   })
@@ -331,7 +338,7 @@ const cards = computed<DashboardCoreCard[]>(() => {
 const period = ref<DashboardPeriod>('week')
 const periods: DashboardPeriod[] = ['week', 'month']
 const selectedSeries = (key: DashboardMetricKey) => metric(key)?.series[period.value] ?? []
-const sumSeries = (key: DashboardMetricKey) => selectedSeries(key).reduce((total, point) => total + point.value, 0)
+const sumSeries = (key: DashboardMetricKey) => sumDashboardSeries(selectedSeries(key))
 
 const periodTotals = computed(() => ({
   revenue: sumSeries('todayProfit'),
@@ -351,7 +358,7 @@ const performanceChartOption = computed<EChartsCoreOption>(() => {
   const cost = selectedSeries('todayPurchase')
   const profit = selectedSeries('netProfit')
   const theme = chartTheme.value
-  const commonSeries = (name: string, data: number[], color: string) => ({
+  const commonSeries = (name: string, data: (number | null)[], color: string) => ({
     name,
     data,
     itemStyle: { color },
@@ -392,7 +399,7 @@ const performanceChartOption = computed<EChartsCoreOption>(() => {
     series: [
       { ...commonSeries(t('admin.dashboard.metrics.todayProfit'), revenue.map(point => point.value), theme.primary), type: 'bar', barMaxWidth: 18, itemStyle: { color: theme.primary, borderRadius: [3, 3, 0, 0] } },
       { ...commonSeries(t('admin.dashboard.metrics.todayPurchase'), cost.map(point => point.value), theme.warning), type: 'bar', barMaxWidth: 18, itemStyle: { color: theme.warning, borderRadius: [3, 3, 0, 0] } },
-      { ...commonSeries(t('admin.dashboard.metrics.netProfit'), profit.map(point => point.value), theme.signal), type: 'line', smooth: 0.22, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2.5, color: theme.signal }, itemStyle: { color: theme.signal } },
+      { ...commonSeries(t('admin.dashboard.metrics.netProfit'), profit.map(point => point.value), theme.signal), type: 'line', connectNulls: false, smooth: 0.22, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2.5, color: theme.signal }, itemStyle: { color: theme.signal } },
     ],
   }
 })
@@ -475,10 +482,11 @@ const siteBalance = computed(() => metric('siteBalance')?.current ?? 0)
 const upstreamBalance = computed(() => metric('upstreamBalance')?.current ?? 0)
 const coverageRatio = computed(() => siteBalance.value > 0 ? (upstreamBalance.value / siteBalance.value) * 100 : null)
 const averageDailyCost = computed(() => {
-  const values = selectedSeries('todayPurchase').map(point => point.value)
-  return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : 0
+  const points = selectedSeries('todayPurchase')
+  const total = sumDashboardSeries(points)
+  return total === null ? null : total / points.length
 })
-const runwayDays = computed(() => averageDailyCost.value > 0 ? upstreamBalance.value / averageDailyCost.value : null)
+const runwayDays = computed(() => averageDailyCost.value !== null && averageDailyCost.value > 0 ? upstreamBalance.value / averageDailyCost.value : null)
 const coverageWidth = computed(() => `${Math.min(coverageRatio.value ?? 0, 100)}%`)
 const coverageTone = computed(() => {
   if (coverageRatio.value == null) return 'bg-muted-foreground'
@@ -680,7 +688,7 @@ const lastProbeLabel = computed(() => {
             :color="card.color"
             :delta-direction="card.deltaDirection"
             :delta-text="card.deltaText"
-            :delta-caption="deltaCaption"
+            :delta-caption="card.deltaCaption"
             :clickable="card.clickable"
             :negative-when-up="card.negativeWhenUp"
             @click="handleMetricCardClick(card.key)"
@@ -717,14 +725,17 @@ const lastProbeLabel = computed(() => {
               <div class="min-w-0 px-2 first:pl-0 sm:px-4">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodRevenue') }}</dt>
                 <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-foreground sm:text-base">{{ formatCny(periodTotals.revenue) }}</dd>
+                <dd v-if="periodTotals.revenue === null" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.incomplete') }}</dd>
               </div>
               <div class="min-w-0 px-2 sm:px-4">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodCost') }}</dt>
                 <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-foreground sm:text-base">{{ formatCny(periodTotals.cost) }}</dd>
+                <dd v-if="periodTotals.cost === null" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.incomplete') }}</dd>
               </div>
               <div class="min-w-0 px-2 pr-0 sm:px-4 sm:pr-0">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodProfit') }}</dt>
                 <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-signal sm:text-base">{{ formatCny(periodTotals.profit) }}</dd>
+                <dd v-if="periodTotals.profit === null" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.incomplete') }}</dd>
               </div>
             </dl>
 

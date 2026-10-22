@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -431,20 +432,10 @@ func (s *PlatformService) FetchSub2APIGroupDailyStats(session Session, groups ..
 // 查询指定日期范围内的总实际消费（即站点的盈利额度）。
 // startDate 和 endDate 格式为 "2006-01-02"，查询当天数据时两者传同一天即可。
 func (s *PlatformService) FetchSub2APIAdminUsageStats(session Session, startDate, endDate string) (float64, error) {
-	if session.Platform != PlatformSub2API || !session.IsAuthenticated() {
+	if session.Platform != PlatformSub2API {
 		return 0, newRequestError(ErrorAuth, PlatformSub2API)
 	}
-	statsURL := session.BaseURL + "/api/v1/admin/usage/stats?start_date=" + startDate + "&end_date=" + endDate
-	response, err := s.httpClient.requestJSON(statsURL, adminAuthOptions(session))
-	if err != nil {
-		return 0, err
-	}
-	data := dataRecord(response.Payload)
-	cost := firstNumber(data, []string{"total_actual_cost", "totalActualCost", "total_cost", "totalCost"})
-	if cost == nil {
-		return 0, nil
-	}
-	return *cost, nil
+	return s.FetchAdminUsageStatsContext(context.Background(), session, startDate, endDate)
 }
 
 // FetchSub2APIAdminSiteBalance 使用默认过滤规则（排除 admin 角色）统计站点用户总余额。
@@ -1495,38 +1486,12 @@ func (s *PlatformService) DeleteSub2APIAdminAccount(session Session, accountID s
 // FetchAdminUsageStats 平台中性的管理员今日消费查询。
 // sub2api 返回 actual_cost，new-api 返回 quota 并按 quotaPerUnit 换算为 USD。
 func (s *PlatformService) FetchAdminUsageStats(session Session, startDate, endDate string) (float64, error) {
-	switch session.Platform {
-	case PlatformNewAPI:
-		return s.fetchNewAPIAdminUsageStats(session, startDate, endDate)
-	default:
-		return s.FetchSub2APIAdminUsageStats(session, startDate, endDate)
-	}
+	return s.FetchAdminUsageStatsContext(context.Background(), session, startDate, endDate)
 }
 
-// fetchNewAPIAdminUsageStats 调用 new-api /api/log/self/stat 获取指定日期范围内的总消费 quota。
+// fetchNewAPIAdminUsageStats 保留既有包内调用入口，日期语义统一由日统计查询持有。
 func (s *PlatformService) fetchNewAPIAdminUsageStats(session Session, startDate, endDate string) (float64, error) {
-	if !session.IsAuthenticated() {
-		return 0, newRequestError(ErrorAuth, PlatformNewAPI)
-	}
-	start, err := time.Parse("2006-01-02", startDate)
-	if err != nil {
-		return 0, err
-	}
-	end, err := time.Parse("2006-01-02", endDate)
-	if err != nil {
-		return 0, err
-	}
-	startTS := start.Unix()
-	endTS := time.Date(end.Year(), end.Month(), end.Day(), 23, 59, 59, 0, end.Location()).Unix()
-	statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(startTS) + "&end_timestamp=" + strconvInt(endTS)
-	cookieOptions := newAPIAuthOptions(session)
-	response, err := s.httpClient.requestJSON(statURL, cookieOptions)
-	if err != nil {
-		return 0, err
-	}
-	data := dataRecord(response.Payload)
-	quota := firstNumber(data, []string{"quota"})
-	return quotaToUSDValueWithUnit(quota, session.QuotaPerUnit), nil
+	return s.FetchAdminUsageStatsContext(context.Background(), session, startDate, endDate)
 }
 
 // FetchAdminSiteBalanceFiltered 平台中性的站点用户总余额统计。

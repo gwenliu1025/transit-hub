@@ -425,6 +425,7 @@ export default {
       },
       delta: {
         vsPrev: 'vs prev day',
+        missingYesterday: 'Yesterday’s data unavailable',
         percentagePoints: '{value} pts'
       },
       common: {
@@ -433,6 +434,7 @@ export default {
       performance: {
         title: 'Business Performance',
         subtitle: 'Revenue, cost, and net profit from Monday or the 1st of this month to date (Asia/Shanghai)',
+        incomplete: 'Incomplete data',
         periodRevenue: 'Period Revenue',
         periodCost: 'Period Cost',
         periodProfit: 'Period Net Profit',

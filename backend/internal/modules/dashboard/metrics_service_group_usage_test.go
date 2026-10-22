@@ -123,6 +123,13 @@ func (f *fakePlatformClient) RefreshSession(session upstream.Session) (upstream.
 	return session, nil
 }
 
+func (f *fakePlatformClient) FetchAdminUsageStatsContext(ctx context.Context, session upstream.Session, startDate, endDate string) (float64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return f.FetchAdminUsageStats(session, startDate, endDate)
+}
+
 func (f *fakePlatformClient) FetchAdminUsageStats(session upstream.Session, startDate, endDate string) (float64, error) {
 	return 0, nil
 }
