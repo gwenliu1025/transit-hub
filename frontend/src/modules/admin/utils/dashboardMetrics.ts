@@ -23,14 +23,13 @@ export function dashboardDate(now = new Date()): string {
   return `${part('year')}-${part('month')}-${part('day')}`
 }
 
-// 完整性由后端声明；旧响应缺标志时也按未确认处理。
-function confirmedValue(point: DashboardTrendPoint | undefined, key: DashboardMetricKey): number | null {
-  if (!point) return null
-  const complete = key === 'todayProfit' ? point.revenueComplete === true
-    : key === 'todayPurchase' ? point.purchaseComplete === true
-    : key === 'netProfit' ? point.revenueComplete === true && point.purchaseComplete === true
-    : point.balanceRecorded === true
-  return complete && Number.isFinite(point[key]) ? point[key] : null
+// 历史成本与净利按用户采用的现有记录展示；日结标志仍归后端写入保护，不作这两项的展示门禁。
+function historicalValue(point: DashboardTrendPoint | undefined, key: DashboardMetricKey): number | null {
+  if (!point || !Number.isFinite(point[key])) return null
+  // 直接取存储净利，不按当前收入、成本或倍率重算历史账。
+  if (key === 'todayPurchase' || key === 'netProfit') return point[key]
+  const complete = key === 'todayProfit' ? point.revenueComplete === true : point.balanceRecorded === true
+  return complete ? point[key] : null
 }
 
 function dateLabel(date: string): string {
@@ -69,12 +68,12 @@ export function buildDashboardMetrics(
   }
 
   return METRIC_CONFIGS.map(({ key, color }) => {
-    const previous = confirmedValue(history.get(yesterday), key)
+    const previous = historicalValue(history.get(yesterday), key)
     const comparison = previous === null ? [] : [{ label: dateLabel(yesterday), value: previous }]
     comparison.push({ label: dateLabel(today), value: live[key] })
     const series = (start: string): TrendPoint[] => dates.filter(date => date >= start).map(date => ({
       label: dateLabel(date),
-      value: date === today ? live[key] : confirmedValue(history.get(date), key),
+      value: date === today ? live[key] : historicalValue(history.get(date), key),
     }))
     return {
       key,

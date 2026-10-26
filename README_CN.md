@@ -112,7 +112,7 @@ git clone https://github.com/gwenliu1025/transit-hub.git transit-hub
 cd transit-hub
 
 # 先编辑 deploy/docker-compose.prod.yml：
-# - 本地构建的镜像标签（默认 transit-hub:v0.1.17）
+# - 本地构建的镜像标签（默认 transit-hub:v0.1.18）
 # - 替换所有 change-this-* 占位值
 # - DATABASE_URL 和 POSTGRES_PASSWORD 中的数据库密码
 # - ADMIN_EMAIL / ADMIN_PASSWORD
@@ -165,7 +165,7 @@ docker compose -f deploy/docker-compose.yml up -d
 由于 Dockerfile 放在 `deploy/`，但构建上下文需要使用仓库根目录，请使用：
 
 ```bash
-docker build -f deploy/Dockerfile -t transit-hub:v0.1.17 .
+docker build -f deploy/Dockerfile -t transit-hub:v0.1.18 .
 ```
 
 ## 本地开发
