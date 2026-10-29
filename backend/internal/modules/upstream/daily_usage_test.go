@@ -141,7 +141,15 @@ func TestDailyPurchaseFailureIsNotZero(t *testing.T) {
 			}
 			value, err := dailyPurchaseForTest(s, context.Background(), "user", "account", "2026-10-22")
 			wantErr := mode != "zero-rate" && mode != "empty"
-			if (err != nil) != wantErr || value != 0 {
+			// 部分失败不再拖垮整个工作区：成功站点的精确值照常落账，但结果标记为不完整。
+			wantValue := 0.0
+			if mode == "partial-failure" {
+				wantValue = 9
+				if !errors.Is(err, errIncompleteForTest) {
+					t.Fatalf("partial failure must be reported as incomplete: %v", err)
+				}
+			}
+			if (err != nil) != wantErr || value != wantValue {
 				t.Fatalf("value=%v err=%v", value, err)
 			}
 		})
@@ -261,9 +269,17 @@ func ptrFloat(v float64) *float64 { return &v }
 // 测试统一经受保护的消费者读取金额，生产不再保留裸金额采集入口。
 func dailyPurchaseForTest(s *Service, ctx context.Context, userID, accountID, date string) (float64, error) {
 	var value float64
-	err := s.WithDailyPurchaseForAccount(ctx, userID, accountID, date, func(_ context.Context, amount float64) error { value = amount; return nil })
+	err := s.WithDailyPurchaseForAccount(ctx, userID, accountID, date, func(_ context.Context, result DailyPurchaseResult) error {
+		value = result.Amount
+		if !result.Complete {
+			return errIncompleteForTest
+		}
+		return nil
+	})
 	return value, err
 }
+
+var errIncompleteForTest = errors.New("daily purchase incomplete")
 
 type dailyTestRepository struct {
 	cache *fakeSiteCache
@@ -316,7 +332,7 @@ func TestDailyPurchaseAuthoritativeMembership(t *testing.T) {
 				cache.sites["one"].RechargeRate = 2
 			}
 			called := false
-			err := s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(context.Context, float64) error { called = true; return nil })
+			err := s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(context.Context, DailyPurchaseResult) error { called = true; return nil })
 			if err == nil || called {
 				t.Fatalf("err=%v consumer=%v", err, called)
 			}
@@ -330,8 +346,8 @@ func TestDailyPurchaseConsumerHoldsConfigurationStable(t *testing.T) {
 	entered, release, updated := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	result := make(chan error, 1)
 	go func() {
-		result <- s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(ctx context.Context, amount float64) error {
-			if amount != 9 {
+		result <- s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(ctx context.Context, result DailyPurchaseResult) error {
+			if amount := result.Amount; amount != 9 || !result.Complete {
 				t.Errorf("amount=%v", amount)
 			}
 			deadline, ok := ctx.Deadline()
@@ -367,12 +383,12 @@ func TestDailyPurchaseConsumerHoldsConfigurationStable(t *testing.T) {
 func TestDailyPurchaseConsumerFailureAndCancellation(t *testing.T) {
 	s, _ := dailyTestService(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"data":{"total_actual_cost":18}}`) })
 	expected := errors.New("commit rejected")
-	err := s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(context.Context, float64) error { return expected })
+	err := s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(context.Context, DailyPurchaseResult) error { return expected })
 	if !errors.Is(err, expected) {
 		t.Fatalf("commit error lost: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	err = s.WithDailyPurchaseForAccount(ctx, "user", "account", "2026-10-22", func(consumerCtx context.Context, _ float64) error {
+	err = s.WithDailyPurchaseForAccount(ctx, "user", "account", "2026-10-22", func(consumerCtx context.Context, _ DailyPurchaseResult) error {
 		cancel()
 		<-consumerCtx.Done()
 		return consumerCtx.Err()
@@ -416,7 +432,7 @@ func TestDailyPurchaseRealCacheMissingMember(t *testing.T) {
 	repo := &dailyTestRepository{sites: []Site{{ID: "one", UserID: "user", AdminAccountID: "account", RechargeRate: 1}}}
 	s := NewService(nil, repo, nil, cache)
 	called := false
-	err = s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(context.Context, float64) error { called = true; return nil })
+	err = s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(context.Context, DailyPurchaseResult) error { called = true; return nil })
 	if err == nil || called || !strings.Contains(err.Error(), "cache member missing") {
 		t.Fatalf("missing member accepted: %v consumer=%v", err, called)
 	}
@@ -501,5 +517,64 @@ func TestDatedUsagePublicEntryPoints(t *testing.T) {
 				t.Fatalf("context API %v", err)
 			}
 		})
+	}
+}
+
+// 失败站点在当日有过成功同步时，用最后一次缓存的当日消费兜底；其它站点照常取精确值。
+func TestDailyPurchaseFailedSiteFallsBackToSameDayCache(t *testing.T) {
+	s, cache := dailyTestService(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"data":{"total_actual_cost":18}}`) })
+	sameDay := time.Date(2026, 10, 22, 23, 58, 0, 0, time.FixedZone("CST", 8*3600)).UnixMilli()
+	nextDay := time.Date(2026, 10, 23, 0, 1, 0, 0, time.FixedZone("CST", 8*3600)).UnixMilli()
+	broken := newTestSite("broken", "user", "account", 2, nil)
+	broken.LastSyncedAt = &sameDay
+	broken.Metrics.TodayConsume.Value = ptrFloat(5)
+	cache.add(broken)
+	rolled := newTestSite("rolled", "user", "account", 3, nil)
+	rolled.LastSyncedAt = &nextDay
+	rolled.Metrics.TodayConsume.Value = ptrFloat(100)
+	cache.add(rolled)
+	var got DailyPurchaseResult
+	err := s.WithDailyPurchaseForAccount(context.Background(), "user", "account", "2026-10-22", func(_ context.Context, result DailyPurchaseResult) error {
+		got = result
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 9（精确）+ 5×2（同日缓存兜底）；次日缓存不能冒充前一天的消费。
+	if got.Amount != 19 || got.Complete || got.FailedSites != 2 || got.TotalSites != 3 || got.Cause == nil {
+		t.Fatalf("result=%+v", got)
+	}
+}
+
+// 日结前必须续期临期令牌并立即持久化，不能拿过期令牌请求导致整晚成本落空。
+func TestDailyPurchaseRefreshesExpiringSession(t *testing.T) {
+	var refreshed atomic.Int32
+	s, cache := dailyTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			refreshed.Add(1)
+			fmt.Fprint(w, `{"data":{"access_token":"fresh","refresh_token":"rt-2","expires_in":3600}}`)
+		default:
+			if r.Header.Get("Authorization") != "Bearer fresh" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			fmt.Fprint(w, `{"data":{"total_actual_cost":18}}`)
+		}
+	})
+	expired := time.Now().Add(-time.Minute).UnixMilli()
+	session := *cache.sites["one"].Session
+	session.RefreshToken = "rt-1"
+	session.TokenType = "Bearer"
+	session.ExpiresAt = &expired
+	cache.sites["one"].Session = &session
+	got, err := dailyPurchaseForTest(s, context.Background(), "user", "account", "2026-10-22")
+	if err != nil || got != 9 || refreshed.Load() != 1 {
+		t.Fatalf("got=%v err=%v refreshed=%d", got, err, refreshed.Load())
+	}
+	stored, _ := cache.Get(context.Background(), "one")
+	if stored.Session.AccessToken != "fresh" || stored.Session.RefreshToken != "rt-2" {
+		t.Fatalf("refreshed session not persisted: %+v", stored.Session)
 	}
 }

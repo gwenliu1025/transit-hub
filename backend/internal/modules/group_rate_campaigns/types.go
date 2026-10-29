@@ -3,7 +3,8 @@ package group_rate_campaigns
 import "time"
 
 // 活动状态机：draft 可编辑/删除；scheduled 等待调度器开始；running 运行中，只能手动结束；
-// ending 正在恢复原倍率（调度器/手动结束的中间态）；ended/partial/failed/cancelled 均为终态，不再被调度器处理。
+// ending 正在恢复原倍率（调度器/手动结束的中间态，卡住超时后由调度器重新接管）；
+// partial 表示开启或恢复部分失败，定时结束的活动会按退避有界重试恢复；ended/failed/cancelled 为终态。
 const (
 	StatusDraft     = "draft"
 	StatusScheduled = "scheduled"

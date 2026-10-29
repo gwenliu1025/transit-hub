@@ -54,6 +54,7 @@ type Service struct {
 	mu                sync.Mutex
 	configGenerations map[refreshWorkspace]uint64
 	cacheEpoch        uint64
+	sessionLocks      map[string]*sync.Mutex
 	// AfterSync 在站点同步成功后被调用，传入同步前后的指标数据。
 	// 由系统设置模块注入，用于余额预警和倍率变更检测。
 	AfterSync func(ctx context.Context, userID, adminAccountID, siteID, siteName string, oldMetrics, newMetrics Metrics)
@@ -233,31 +234,24 @@ func (s *Service) FetchGroupDailyStats(ctx context.Context, userID string, id st
 	if site.AdminAccountID != aid {
 		return nil, newRequestError(ErrorNotFound, "")
 	}
-	session := *site.Session
 	groups := append([]GroupInfo(nil), site.Metrics.Groups...)
 
-	refreshedSession, err := s.platformService.RefreshSession(session)
-	if err != nil {
-		return nil, err
-	}
+	// 续期后的会话由 withSiteSession 立即写回，不再在请求结束后用可能过时的会话覆盖缓存。
 	var stats []GroupDailyStat
-	if refreshedSession.Platform == PlatformNewAPI {
-		stats, err = s.platformService.FetchNewAPIGroupDailyStats(refreshedSession, groups)
-	} else if refreshedSession.Platform == PlatformSub2API {
-		stats, err = s.platformService.FetchSub2APIGroupDailyStats(refreshedSession, groups)
-	} else {
-		return nil, newRequestError(ErrorNotFound, "")
-	}
+	_, err = s.withSiteSession(ctx, id, func(session Session) error {
+		var fetchErr error
+		switch session.Platform {
+		case PlatformNewAPI:
+			stats, fetchErr = s.platformService.FetchNewAPIGroupDailyStats(session, groups)
+		case PlatformSub2API:
+			stats, fetchErr = s.platformService.FetchSub2APIGroupDailyStats(session, groups)
+		default:
+			fetchErr = newRequestError(ErrorNotFound, "")
+		}
+		return fetchErr
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	// 将刷新后的会话写回缓存和数据库。
-	site, err = s.cache.Get(ctx, id)
-	if err == nil && site != nil && site.UserID == userID {
-		site.Session = &refreshedSession
-		_ = s.setCachedSite(ctx, site)
-		_ = s.saveSite(ctx, site)
 	}
 	return stats, nil
 }
@@ -307,26 +301,18 @@ func (s *Service) KeyUsageToday(ctx context.Context, userID string) ([]KeyUsageT
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			session := *site.Session
 			groups := append([]GroupInfo(nil), site.Metrics.Groups...)
 
-			refreshedSession, refreshErr := s.platformService.RefreshSession(session)
-			if refreshErr != nil {
-				recordFailure(refreshErr)
-				return
-			}
-
-			stats, fetchErr := s.platformService.FetchKeyUsageToday(refreshedSession, groups)
+			// 续期后的会话由 withSiteSession 立即写回，与 FetchGroupDailyStats 一致。
+			var stats []KeyUsageTodayStat
+			_, fetchErr := s.withSiteSession(ctx, site.ID, func(session Session) error {
+				var err error
+				stats, err = s.platformService.FetchKeyUsageToday(session, groups)
+				return err
+			})
 			if fetchErr != nil {
 				recordFailure(fetchErr)
 				return
-			}
-
-			// 将刷新后的会话写回缓存和数据库，与 FetchGroupDailyStats 的写回模式一致。
-			if cached, cacheErr := s.cache.Get(ctx, site.ID); cacheErr == nil && cached != nil && cached.UserID == site.UserID {
-				cached.Session = &refreshedSession
-				_ = s.setCachedSite(ctx, cached)
-				_ = s.saveSite(ctx, cached)
 			}
 
 			mu.Lock()
@@ -784,6 +770,27 @@ func (s *Service) SyncAllStream(ctx context.Context, userID string, emit SyncEve
 
 // sync 执行单个站点的同步流程：刷新会话 → 拉取最新指标 → 更新缓存和数据库。
 func (s *Service) sync(ctx context.Context, id string) (Response, error) {
+	// 无论本次因何失败（含 Redis 抖动），都要排下一次定时同步，避免该站点的自动刷新链永久中断。
+	rescheduled := false
+	defer func() {
+		if rescheduled {
+			return
+		}
+		background, cancel := context.WithTimeout(context.Background(), persistenceTimeout)
+		defer cancel()
+		site, err := s.cache.Get(background, id)
+		if err != nil {
+			// 缓存读取失败时用数据库中的配置兜底排期；缓存明确不存在（已删除）则不再排期。
+			site = s.siteFromRepository(background, id)
+		}
+		if site == nil {
+			return
+		}
+		s.mu.Lock()
+		s.scheduleSyncLocked(id, site)
+		s.mu.Unlock()
+	}()
+
 	site, err := s.cache.Get(ctx, id)
 	if err != nil {
 		return Response{}, err
@@ -796,14 +803,16 @@ func (s *Service) sync(ctx context.Context, id string) (Response, error) {
 	site.Status = StatusSyncing
 	site.ErrorKey = nil
 	_ = s.setCachedSite(ctx, site)
-	session := *site.Session
 
-	// 刷新会话并拉取指标（无锁操作，可能耗时较长）。
-	refreshedSession, refreshErr := s.platformService.RefreshSession(session)
+	// “今日”按开始拉取的时刻归属，避免跨午夜的慢同步把前一天全天消费记到新的一天。
+	startedAt := time.Now().UnixMilli()
 	metrics := Metrics{}
-	if refreshErr == nil {
-		metrics, refreshErr = s.platformService.FetchMetrics(refreshedSession)
-	}
+	// 续期后的令牌由 withSiteSession 立即持久化，不受后续指标请求成败影响。
+	_, refreshErr := s.withSiteSession(ctx, id, func(session Session) error {
+		var fetchErr error
+		metrics, fetchErr = s.platformService.FetchMetrics(session)
+		return fetchErr
+	})
 
 	// 重新读取站点确认仍存在（可能在同步期间被删除）。
 	site, err = s.cache.Get(ctx, id)
@@ -819,12 +828,10 @@ func (s *Service) sync(ctx context.Context, id string) (Response, error) {
 		key := errorKey(refreshErr)
 		site.ErrorKey = &key
 	} else {
-		now := time.Now().UnixMilli()
-		site.Session = &refreshedSession
 		site.Metrics = metrics
 		site.Status = StatusConnected
 		site.ErrorKey = nil
-		site.LastSyncedAt = &now
+		site.LastSyncedAt = &startedAt
 	}
 
 	_ = s.setCachedSite(ctx, site)
@@ -832,6 +839,7 @@ func (s *Service) sync(ctx context.Context, id string) (Response, error) {
 	s.mu.Lock()
 	s.scheduleSyncLocked(id, site)
 	s.mu.Unlock()
+	rescheduled = true
 
 	response := toResponse(site)
 	if saveErr := s.saveSite(ctx, site); saveErr != nil {
@@ -1177,6 +1185,22 @@ func (s *Service) setCachedSite(ctx context.Context, site *Site) error {
 		s.bumpConfigLocked(site)
 	}
 	return s.cache.Set(ctx, site)
+}
+
+func (s *Service) siteFromRepository(ctx context.Context, id string) *Site {
+	if s.repository == nil {
+		return nil
+	}
+	sites, err := s.repository.ListSites(ctx)
+	if err != nil {
+		return nil
+	}
+	for i := range sites {
+		if sites[i].ID == id {
+			return &sites[i]
+		}
+	}
+	return nil
 }
 
 func (s *Service) isSiteDeleted(id string) bool {

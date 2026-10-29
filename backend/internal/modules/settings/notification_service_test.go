@@ -217,3 +217,73 @@ func TestNotificationSettingsWithoutNewChannelsRemainCompatible(t *testing.T) {
 		t.Fatalf("expected an empty non-nil QQ settings list, got %#v", settings.QQ)
 	}
 }
+
+// fakeNotificationChannelReader 按 userID|adminAccountID 返回渠道配置，模拟多工作区隔离存储。
+type fakeNotificationChannelReader struct {
+	byWorkspace map[string]NotificationChannelSettings
+	requested   []string
+}
+
+func (f *fakeNotificationChannelReader) GetNotificationChannels(_ context.Context, userID string, adminAccountID string) (NotificationChannelSettings, error) {
+	key := userID + "|" + adminAccountID
+	f.requested = append(f.requested, key)
+	if settings, ok := f.byWorkspace[key]; ok {
+		return settings, nil
+	}
+	return DefaultNotificationChannelSettings(), nil
+}
+
+// TestSendToBotsForWorkspaceUsesExplicitWorkspaceChannels 回归：用户同时拥有工作区 A/B 且当前选中 B 时，
+// A 的后台通知必须按 A 的渠道配置发送，不能拿 A 的机器人 ID 去 B 的渠道里查找后静默丢弃。
+func TestSendToBotsForWorkspaceUsesExplicitWorkspaceChannels(t *testing.T) {
+	received := make(chan string, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.URL.Query().Get("key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	reader := &fakeNotificationChannelReader{byWorkspace: map[string]NotificationChannelSettings{
+		"user-1|workspace-a": {Wecom: []WebhookChannelSettings{{ID: "bot-a", Name: "A", Webhook: server.URL + "?key=workspace-a"}}},
+		"user-1|workspace-b": {Wecom: []WebhookChannelSettings{{ID: "bot-b", Name: "B", Webhook: server.URL + "?key=workspace-b"}}},
+	}}
+	service := NewService(server.Client(), nil)
+	service.channelReader = reader
+	service.SetAdminAccountResolver(&fakeAdminAccountResolver{id: "workspace-b"})
+
+	service.SendToBotsForWorkspace(context.Background(), "user-1", "workspace-a", []string{"bot-a"}, "balance alert")
+	if got := drainWebhookKeys(received); len(got) != 1 || got[0] != "workspace-a" {
+		t.Fatalf("expected workspace-a bot to receive the plain notification, got %v", got)
+	}
+
+	service.SendFormattedToBotsForWorkspace(context.Background(), "user-1", "workspace-a", []string{"bot-a"}, "**alert**", NotificationTemplateFormatMarkdown)
+	if got := drainWebhookKeys(received); len(got) != 1 || got[0] != "workspace-a" {
+		t.Fatalf("expected workspace-a bot to receive the formatted notification, got %v", got)
+	}
+	for _, key := range reader.requested {
+		if key != "user-1|workspace-a" {
+			t.Fatalf("explicit workspace send must never read another workspace's channels, read %v", reader.requested)
+		}
+	}
+
+	// 旧入口仍按当前选中的工作区解析：A 的机器人不在 B 的渠道里，因此不会发送。
+	service.SendToBots(context.Background(), "user-1", []string{"bot-a"}, "request scoped")
+	if got := drainWebhookKeys(received); len(got) != 0 {
+		t.Fatalf("legacy current-workspace entry must not reach workspace-a bots, got %v", got)
+	}
+	if last := reader.requested[len(reader.requested)-1]; last != "user-1|workspace-b" {
+		t.Fatalf("legacy entry should resolve the current workspace, read %q", last)
+	}
+}
+
+func drainWebhookKeys(received chan string) []string {
+	keys := make([]string, 0)
+	for {
+		select {
+		case key := <-received:
+			keys = append(keys, key)
+		default:
+			return keys
+		}
+	}
+}

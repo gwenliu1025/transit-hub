@@ -19,11 +19,13 @@ type protocolFixture struct {
 	repo    *testConnRepo
 	creates int
 	payload map[string]any
+	// ownPlatform 是管理端分组 7 的平台；分组 8 固定为 anthropic，用于混选场景。
+	ownPlatform string
 }
 
 func newProtocolFixture(t *testing.T, source, admin upstream.Platform, cached string) *protocolFixture {
 	t.Helper()
-	f := &protocolFixture{}
+	f := &protocolFixture{ownPlatform: "openai"}
 	tokenName, channelName := "existing-token", "existing-channel"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -32,7 +34,10 @@ func newProtocolFixture(t *testing.T, source, admin upstream.Platform, cached st
 		case r.Method == http.MethodGet && r.URL.Path == "/api/user/self":
 			writeConnectionTestJSON(w, map[string]any{"data": map[string]any{"role": 10}})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/admin/groups":
-			writeConnectionTestJSON(w, map[string]any{"data": []map[string]any{{"id": 7, "name": "vip", "platform": "openai", "status": "active"}}})
+			writeConnectionTestJSON(w, map[string]any{"data": []map[string]any{
+				{"id": 7, "name": "vip", "platform": f.ownPlatform, "status": "active"},
+				{"id": 8, "name": "pro", "platform": "anthropic", "status": "active"},
+			}})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/group/":
 			writeConnectionTestJSON(w, map[string]any{"data": []string{"7"}})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/user/self/groups":
@@ -91,28 +96,42 @@ func newProtocolFixture(t *testing.T, source, admin upstream.Platform, cached st
 
 func TestRealConnectProtocolSelection(t *testing.T) {
 	for _, tc := range []struct {
-		name, cached, selected, expected, errKey string
-		source                                   upstream.Platform
+		name, cached, selected, own, expected, errKey string
+		source                                        upstream.Platform
+		ownGroupIDs                                   []string
 	}{
-		{"newapi-mixed-selected", "openai, anthropic", "openai", "openai", "", upstream.PlatformNewAPI},
-		{"newapi-unknown-selected", "deepseek", "anthropic", "anthropic", "", upstream.PlatformNewAPI},
-		{"newapi-single-overridden", "anthropic", "openai", "openai", "", upstream.PlatformNewAPI},
-		{"newapi-normalized-selection", "deepseek", " GEMINI ", "gemini", "", upstream.PlatformNewAPI},
-		{"newapi-single-default", "openai", "", "openai", "", upstream.PlatformNewAPI},
-		{"newapi-mixed-missing", "openai, anthropic", "", "", ErrorGroupTypeRequired, upstream.PlatformNewAPI},
-		{"newapi-unknown-missing", "deepseek", "", "", ErrorGroupTypeRequired, upstream.PlatformNewAPI},
-		{"newapi-invalid-selected", "openai", "injected-protocol", "", ErrorGroupTypeInvalid, upstream.PlatformNewAPI},
-		{"sub2api-openai", "openai", "anthropic", "openai", "", upstream.PlatformSub2API},
-		{"sub2api-anthropic", "anthropic", "", "anthropic", "", upstream.PlatformSub2API},
-		{"sub2api-gemini", "gemini", "", "gemini", "", upstream.PlatformSub2API},
-		{"sub2api-antigravity", "antigravity", "", "antigravity", "", upstream.PlatformSub2API},
-		{"sub2api-unknown-selected", "", "openai", "openai", "", upstream.PlatformSub2API},
-		{"sub2api-invalid-selected", "openai", "bad", "", ErrorGroupTypeInvalid, upstream.PlatformSub2API},
+		{"newapi-mixed-selected", "openai, anthropic", "openai", "openai", "openai", "", upstream.PlatformNewAPI, nil},
+		{"newapi-unknown-selected", "deepseek", "anthropic", "anthropic", "anthropic", "", upstream.PlatformNewAPI, nil},
+		{"newapi-single-overridden", "anthropic", "openai", "openai", "openai", "", upstream.PlatformNewAPI, nil},
+		{"newapi-normalized-selection", "deepseek", " GEMINI ", "gemini", "gemini", "", upstream.PlatformNewAPI, nil},
+		// 未显式选择时协议跟随所选自有分组，厂商列表只作推荐，不再决定协议。
+		{"newapi-single-follows-own-group", "openai", "", "anthropic", "anthropic", "", upstream.PlatformNewAPI, nil},
+		{"newapi-mixed-follows-own-group", "openai, anthropic", "", "anthropic", "anthropic", "", upstream.PlatformNewAPI, nil},
+		{"newapi-unknown-follows-own-group", "deepseek", "", "antigravity", "antigravity", "", upstream.PlatformNewAPI, nil},
+		{"newapi-selected-own-group-mismatch", "openai, anthropic", "anthropic", "openai", "", ErrorOwnGroupPlatformMismatch, upstream.PlatformNewAPI, nil},
+		{"newapi-mixed-own-groups", "openai, anthropic", "", "openai", "", ErrorOwnGroupPlatformMismatch, upstream.PlatformNewAPI, []string{"7", "8"}},
+		{"newapi-own-group-unknown-platform", "openai", "", "sora", "", ErrorGroupTypeRequired, upstream.PlatformNewAPI, nil},
+		{"newapi-invalid-selected", "openai", "injected-protocol", "openai", "", ErrorGroupTypeInvalid, upstream.PlatformNewAPI, nil},
+		{"sub2api-openai", "openai", "anthropic", "openai", "openai", "", upstream.PlatformSub2API, nil},
+		{"sub2api-anthropic", "anthropic", "", "anthropic", "anthropic", "", upstream.PlatformSub2API, nil},
+		{"sub2api-gemini", "gemini", "", "gemini", "gemini", "", upstream.PlatformSub2API, nil},
+		{"sub2api-antigravity", "antigravity", "", "antigravity", "antigravity", "", upstream.PlatformSub2API, nil},
+		{"sub2api-unknown-selected", "", "openai", "openai", "openai", "", upstream.PlatformSub2API, nil},
+		{"sub2api-unknown-follows-own-group", "", "", "gemini", "gemini", "", upstream.PlatformSub2API, nil},
+		// 快照类型被“编辑类型”改成 anthropic，前端据此选了 anthropic 分组；后端以缓存的真实平台拒绝。
+		{"sub2api-edited-snapshot-mismatch", "openai", "anthropic", "anthropic", "", ErrorOwnGroupPlatformMismatch, upstream.PlatformSub2API, nil},
+		{"sub2api-mixed-own-groups", "openai", "", "openai", "", ErrorOwnGroupPlatformMismatch, upstream.PlatformSub2API, []string{"7", "8"}},
+		{"sub2api-invalid-selected", "openai", "bad", "openai", "", ErrorGroupTypeInvalid, upstream.PlatformSub2API, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newProtocolFixture(t, tc.source, upstream.PlatformSub2API, tc.cached)
+			f.ownPlatform = tc.own
+			ownGroupIDs := tc.ownGroupIDs
+			if ownGroupIDs == nil {
+				ownGroupIDs = []string{"7"}
+			}
 			noPricing := false
-			result, err := f.service.RealConnect(context.Background(), "user-1", RealConnectRequest{UpstreamSiteID: "site-1", UpstreamGroupID: "7", UpstreamGroupName: "vip", GroupType: tc.selected, OwnGroupIDs: []string{"7"}, AddToPricingMapping: &noPricing})
+			result, err := f.service.RealConnect(context.Background(), "user-1", RealConnectRequest{UpstreamSiteID: "site-1", UpstreamGroupID: "7", UpstreamGroupName: "vip", GroupType: tc.selected, OwnGroupIDs: ownGroupIDs, AddToPricingMapping: &noPricing})
 			if tc.errKey != "" {
 				if err == nil || err.Error() != tc.errKey || f.creates != 0 || f.repo.saveCalls != 0 {
 					t.Fatalf("类型拒收必须零创建零持久化: err=%v creates=%d saves=%d", err, f.creates, f.repo.saveCalls)
@@ -166,6 +185,39 @@ func TestRealConnectNewAPIAdminMixedMetadataKeepsChannelSelection(t *testing.T) 
 	}
 }
 
+func TestRealConnectNewAPIAdminRejectsMissingChannelTypeBeforeRemoteCreation(t *testing.T) {
+	for _, source := range []upstream.Platform{upstream.PlatformNewAPI, upstream.PlatformSub2API} {
+		t.Run(string(source), func(t *testing.T) {
+			f := newProtocolFixture(t, source, upstream.PlatformNewAPI, "anthropic")
+			noPricing := false
+			_, err := f.service.RealConnect(context.Background(), "user-1", RealConnectRequest{UpstreamSiteID: "site-1", UpstreamGroupID: "7", UpstreamGroupName: "vip", OwnGroupIDs: []string{"7"}, AddToPricingMapping: &noPricing})
+			if err == nil || err.Error() != ErrorChannelTypeRequired || f.creates != 0 || f.repo.saveCalls != 0 {
+				t.Fatalf("缺少渠道类型必须在远端创建前拒绝，不得静默回退 OpenAI: err=%v creates=%d saves=%d", err, f.creates, f.repo.saveCalls)
+			}
+		})
+	}
+}
+
+func TestUpstreamGroupProtocolUsesCachedPlatformNotSnapshotType(t *testing.T) {
+	f := newProtocolFixture(t, upstream.PlatformSub2API, upstream.PlatformSub2API, " Anthropic ")
+	got, err := f.service.UpstreamGroupProtocol(context.Background(), "user-1", "site-1", "7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UpstreamPlatform != string(upstream.PlatformSub2API) || got.GroupType != "anthropic" {
+		t.Fatalf("必须返回上游缓存的真实分组平台: %+v", got)
+	}
+	if _, err := f.service.UpstreamGroupProtocol(context.Background(), "user-2", "site-1", "7"); err == nil || err.Error() != ErrorRequest {
+		t.Fatalf("其他用户不得读取该站点: %v", err)
+	}
+	if _, err := f.service.UpstreamGroupProtocol(context.Background(), "user-1", "site-1", ""); err == nil || err.Error() != ErrorRequest {
+		t.Fatalf("缺少分组必须拒绝: %v", err)
+	}
+	if f.creates != 0 {
+		t.Fatal("读取协议不得产生远端写入")
+	}
+}
+
 func TestRealBindMixedMetadataDoesNotRequireCreationProtocol(t *testing.T) {
 	f := newProtocolFixture(t, upstream.PlatformNewAPI, upstream.PlatformSub2API, "openai, anthropic")
 	noPricing := false
@@ -206,6 +258,9 @@ func TestWriteConnectionErrorUsesSafeKeysAndLocalStatus(t *testing.T) {
 		{"local-account", requestError("admin.adminAccounts.errors.noCurrentAccount"), 409, "admin.adminAccounts.errors.noCurrentAccount"},
 		{"protocol-required", requestError(ErrorGroupTypeRequired), 400, ErrorGroupTypeRequired},
 		{"protocol-invalid", requestError(ErrorGroupTypeInvalid), 400, ErrorGroupTypeInvalid},
+		{"own-group-platform-mismatch", requestError(ErrorOwnGroupPlatformMismatch), 400, ErrorOwnGroupPlatformMismatch},
+		{"channel-type-required", requestError(ErrorChannelTypeRequired), 400, ErrorChannelTypeRequired},
+		{"connection-in-progress", requestError(ErrorConnectionInProgress), 409, ErrorConnectionInProgress},
 	}
 	for _, key := range []string{upstream.ErrorInvalidURL, upstream.ErrorNetwork, upstream.ErrorRequest, upstream.ErrorNotFound} {
 		cases = append(cases, struct {

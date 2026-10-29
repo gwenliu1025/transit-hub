@@ -4,13 +4,13 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { AlertCircle, ArrowUpDown, Check, ChevronDown, History, KeyRound, Link2, Loader2, Megaphone, RefreshCw, Search, ServerCog, Sparkles, X } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
-import { getMySiteMappingOptions, realConnect, realBind, listAdminResources, listUpstreamKeys, listRealConnections, realDisconnect } from '../api/mySites'
+import { getMySiteMappingOptions, getUpstreamGroupProtocol, realConnect, realBind, listAdminResources, listUpstreamKeys, listRealConnections, realDisconnect } from '../api/mySites'
 import { getDashboardAdminStatus } from '../api/dashboardAdmin'
 import { useGroupRates } from '../composables/useGroupRates'
 import type { GroupRate, GroupRateHistoryRow } from '../types/groupRates'
 import type { AdminResourceOption, ConnectionCapabilities, MySiteMapping, MySiteMappingOwnGroupOption, RealConnection, UpstreamKeyItem } from '../types/mySites'
 import { LEGACY_NEW_API_CHANNEL_SUGGESTIONS, NEW_API_CHANNEL_TYPES } from '../types/mySites'
-import { connectionErrorKey, effectiveConnectionProtocol, knownConnectionProtocol } from '../utils/connectionOptions'
+import { connectionErrorKey, effectiveConnectionProtocol, inferredProtocols, knownConnectionProtocol, protocolFromOwnGroups, recommendedFirst } from '../utils/connectionOptions'
 
 const { t, locale } = useI18n()
 const router = useRouter()
@@ -120,6 +120,10 @@ const invalidateConnectorReads = () => {
   adminResourcesError.value = ''
 }
 const selectedGroupType = ref('')
+// 后端缓存的上游分组真实平台；读取失败或旧后端时为 null，回退到快照类型（快照可被“编辑类型”改动）。
+const upstreamGroupType = ref<string | null>(null)
+const isLoadingUpstreamGroupType = ref(false)
+let upstreamGroupTypeRequest = 0
 const selectedChannelType = ref(0)
 const adminPlatform = ref('')
 const upstreamKeys = ref<UpstreamKeyItem[]>([])
@@ -149,6 +153,16 @@ const firstMappedOwnGroupForRate = (rate: GroupRate): string => mappedOwnGroupsF
 const filteredOwnGroups = computed(() => {
   // new-api admin 不按渠道类型筛选，直接显示全部自有分组
   if (isAdminNewAPI.value) return ownGroups.value
+  if (isNewAPIUpstream.value && connectionCapabilities.value?.requiresGroupType) {
+    // New API 上游先选分组：列出所有可创建账号的分组，推荐厂商对应的平台排在前面；
+    // 选中后其他平台的分组只禁用不隐藏，协议跟随所选分组。
+    const explicit = knownConnectionProtocol(selectedGroupType.value, connectionCapabilities.value)
+    const candidates = ownGroups.value.filter((group) => {
+      const platform = knownConnectionProtocol(group.platform, connectionCapabilities.value)
+      return Boolean(platform) && (!explicit || platform === explicit)
+    })
+    return recommendedFirst(candidates, inferredGroupTypes.value)
+  }
   const upstreamType = effectiveGroupType.value
   if (connectionCapabilities.value?.requiresGroupType && !upstreamType) return []
   if (upstreamType) {
@@ -269,17 +283,45 @@ const creationCapabilitiesError = computed(() => {
   return t('admin.groupRates.connect.capabilitiesUnavailable')
 })
 const groupTypeOptions = computed(() => connectionCapabilities.value?.groupTypes ?? [])
-const effectiveGroupType = computed(() => effectiveConnectionProtocol(connectingRate.value?.platform, connectingRate.value?.type, selectedGroupType.value, connectionCapabilities.value))
-const needsGroupTypeSelection = computed(() => connectMode.value === 'real' && Boolean(connectionCapabilities.value?.requiresGroupType) && (
-  connectingRate.value?.platform === 'newapi' || !knownConnectionProtocol(connectingRate.value?.type, connectionCapabilities.value)
-))
+const isNewAPIUpstream = computed(() => connectingRate.value?.platform === 'newapi')
+// 优先使用后端缓存的真实平台，避免“编辑类型”改过的快照让前端筛出与后端协议不符的分组。
+const connectingGroupType = computed(() => upstreamGroupType.value || connectingRate.value?.type || '')
+// New API 上游的厂商推断只用于推荐排序与提示，不限制可选分组。
+const inferredGroupTypes = computed(() => isNewAPIUpstream.value ? inferredProtocols(connectingGroupType.value, connectionCapabilities.value) : [])
+const ownGroupProtocol = computed(() => protocolFromOwnGroups(connectOwnGroups.value, ownGroups.value, connectionCapabilities.value))
+const effectiveGroupType = computed(() => effectiveConnectionProtocol(connectingRate.value?.platform, connectingGroupType.value, selectedGroupType.value, connectionCapabilities.value, ownGroupProtocol.value))
+// 只有 Sub2API 上游且分组平台未知时才需要先选协议；New API 上游由所选分组决定协议。
+const needsGroupTypeSelection = computed(() => connectMode.value === 'real' && Boolean(connectionCapabilities.value?.requiresGroupType) &&
+  !isNewAPIUpstream.value && !knownConnectionProtocol(connectingGroupType.value, connectionCapabilities.value))
 const needsChannelTypeSelection = computed(() => connectMode.value === 'real' && Boolean(connectionCapabilities.value?.requiresChannelType))
+const usesOwnGroupProtocol = computed(() => isNewAPIUpstream.value && !isAdminNewAPI.value && Boolean(connectionCapabilities.value?.requiresGroupType))
+const effectiveGroupTypeName = computed(() => groupTypeOptions.value.find(option => option.id === effectiveGroupType.value)?.name ?? effectiveGroupType.value)
+// 所选协议不在上游声明的厂商内时提示核对，但不阻止提交。
+const isProtocolOutsideInference = computed(() => usesOwnGroupProtocol.value && Boolean(effectiveGroupType.value) &&
+  inferredGroupTypes.value.length > 0 && !inferredGroupTypes.value.includes(effectiveGroupType.value))
+const isRecommendedOwnGroup = (group: MySiteMappingOwnGroupOption): boolean => (
+  usesOwnGroupProtocol.value && inferredGroupTypes.value.includes(group.platform.trim().toLowerCase())
+)
+// 一个 Sub2API 账号只能绑定同平台分组：选中后其他平台的分组禁用。
+const isOwnGroupLocked = (group: MySiteMappingOwnGroupOption): boolean => (
+  usesOwnGroupProtocol.value && Boolean(effectiveGroupType.value) && !connectOwnGroups.value.includes(group.id) &&
+  knownConnectionProtocol(group.platform, connectionCapabilities.value) !== effectiveGroupType.value
+)
+const ownGroupEmptyText = computed(() => {
+  if (ownGroups.value.length === 0) return t('admin.groupRates.connect.ownGroupEmpty')
+  if (needsGroupTypeSelection.value && !effectiveGroupType.value) return t('admin.groupRates.connect.ownGroupNeedProtocol')
+  if (!isAdminNewAPI.value && effectiveGroupType.value && !usesOwnGroupProtocol.value) {
+    return t('admin.groupRates.connect.ownGroupEmptyForProtocol', { protocol: effectiveGroupTypeName.value })
+  }
+  return t('admin.groupRates.connect.ownGroupEmpty')
+})
 
 // 渠道建议只决定默认值，不截断管理端实际支持的渠道列表。
 const filteredChannelTypes = computed(() => connectionCapabilities.value?.channelTypes ?? [])
 const applyConnectionDefaults = () => {
-  selectedGroupType.value = knownConnectionProtocol(connectingRate.value?.type, connectionCapabilities.value)
-  const groupType = (connectingRate.value?.type ?? '').trim().toLowerCase()
+  // New API 上游不预选协议，避免把厂商推断当作协议筛掉其他平台的分组。
+  selectedGroupType.value = isNewAPIUpstream.value ? '' : knownConnectionProtocol(connectingGroupType.value, connectionCapabilities.value)
+  const groupType = connectingGroupType.value.trim().toLowerCase()
   const suggested = connectionCapabilities.value?.suggestedChannelTypeByGroup?.[groupType] ?? LEGACY_NEW_API_CHANNEL_SUGGESTIONS[groupType]
   selectedChannelType.value = filteredChannelTypes.value.some(option => option.id === suggested) ? suggested! : 0
 }
@@ -292,7 +334,7 @@ const canSubmitConnect = computed(() => {
   if (connectMode.value === 'bind') {
     return Boolean(!isLoadingKeys.value && !keysError.value && !isLoadingAdminResources.value && !adminResourcesError.value && selectedKeyId.value && selectedAdminGroupId.value && selectedAdminResourceId.value)
   }
-  if (creationCapabilitiesError.value) return false
+  if (creationCapabilitiesError.value || isLoadingUpstreamGroupType.value) return false
   if (connectOwnGroups.value.length === 0 || !connectOwnGroups.value.every(id => filteredOwnGroups.value.some(group => group.id === id))) return false
   // sub2api admin：分组类型未知时必须手动选择
   if (connectionCapabilities.value?.requiresGroupType && !effectiveGroupType.value) return false
@@ -417,8 +459,23 @@ const openConnector = async (rate: GroupRate) => {
   addToPricingMapping.value = true
   connectOperationId.value = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
   const epoch = connectorEpoch
-  await loadMySiteMappingData()
+  await Promise.all([loadMySiteMappingData(), loadUpstreamGroupType(rate)])
   if (epoch === connectorEpoch) applyConnectionDefaults()
+}
+
+// 读取后端缓存的上游分组真实平台；与模式切换无关，只在关闭或重新打开弹窗时失效。
+const loadUpstreamGroupType = async (rate: GroupRate) => {
+  const request = ++upstreamGroupTypeRequest
+  upstreamGroupType.value = null
+  isLoadingUpstreamGroupType.value = true
+  try {
+    const result = await getUpstreamGroupProtocol(rate.siteId, rate.groupId ?? '')
+    if (request === upstreamGroupTypeRequest) upstreamGroupType.value = result.groupType.trim() || null
+  } catch {
+    // 旧后端或读取失败时回退到快照类型；后端创建时仍按真实平台校验所选分组。
+  } finally {
+    if (request === upstreamGroupTypeRequest) isLoadingUpstreamGroupType.value = false
+  }
 }
 
 const isActiveResourceStatus = (status: string): boolean => ['1', 'active', 'enabled'].includes(status.toLowerCase())
@@ -439,6 +496,9 @@ const adminResourceTypeLabel = (resource: AdminResourceOption): string => {
 
 const closeConnector = () => {
   invalidateConnectorReads()
+  upstreamGroupTypeRequest++
+  upstreamGroupType.value = null
+  isLoadingUpstreamGroupType.value = false
   connectingRate.value = null
   connectOwnGroups.value = []
   connectMode.value = 'real'
@@ -468,9 +528,10 @@ const setConnectMode = async (mode: 'real' | 'bind') => {
   selectedAdminResourceId.value = ''
   adminResources.value = []
   realConnectError.value = ''
-  applyConnectionDefaults()
   if (!hasLoadedMappingOptions.value) await loadMySiteMappingData()
   if (epoch !== connectorEpoch) return
+  // 能力读取完成后再套用默认值，否则首次读取失败后切换模式会一直缺少协议/渠道默认值。
+  applyConnectionDefaults()
   if (mode === 'bind' && connectingRate.value) {
     await loadUpstreamKeys(connectingRate.value)
   }
@@ -545,6 +606,8 @@ const retryMappingOptions = async () => {
 const toggleOwnGroup = (groupId: string) => {
   const index = connectOwnGroups.value.indexOf(groupId)
   if (index === -1) {
+    const group = ownGroups.value.find(item => item.id === groupId)
+    if (group && isOwnGroupLocked(group)) return
     connectOwnGroups.value = [...connectOwnGroups.value, groupId]
   } else {
     connectOwnGroups.value = connectOwnGroups.value.filter(id => id !== groupId)
@@ -1160,7 +1223,7 @@ const historyRowKey = (row: GroupRateHistoryRow, index: number): string => (
             <Button type="button" variant="secondary" @click="retryMappingOptions">{{ t('admin.groupRates.connect.reload') }}</Button>
           </div>
 
-          <!-- New API 的厂商推断仅作默认值，实际创建协议由用户确认。 -->
+          <!-- 仅 Sub2API 上游分组平台未知时需要先选协议；New API 上游的协议跟随所选自有分组。 -->
           <div v-if="needsGroupTypeSelection" class="space-y-2">
             <span class="text-sm font-medium text-foreground">{{ t('admin.groupRates.connect.groupTypeLabel') }}</span>
             <div class="relative">
@@ -1312,28 +1375,42 @@ const historyRowKey = (row: GroupRateHistoryRow, index: number): string => (
 
           <div v-if="connectMode === 'real' && !isLoadingMappingOptions && !mappingOptionsError && !creationCapabilitiesError" class="space-y-2">
             <span class="text-sm font-medium text-foreground">{{ t('admin.groupRates.connect.ownGroupLabel') }}</span>
+            <p v-if="usesOwnGroupProtocol" class="text-xs leading-5 text-muted-foreground">{{ t('admin.groupRates.connect.ownGroupFirstHint') }}</p>
             <div class="max-h-48 overflow-auto rounded-xl border border-border/50 bg-surface divide-y divide-border/30">
               <label
                 v-for="group in filteredOwnGroups"
                 :key="group.id"
-                class="flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors hover:bg-surface-elevated"
+                :class="[
+                  'flex items-center gap-3 px-4 py-2.5 transition-colors',
+                  isOwnGroupLocked(group) ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-surface-elevated'
+                ]"
               >
                 <input
                   type="checkbox"
                   :checked="connectOwnGroups.includes(group.id)"
                   class="h-4 w-4 rounded border-border text-primary focus:ring-primary"
-                  :disabled="isActionLoading"
+                  :disabled="isActionLoading || isOwnGroupLocked(group)"
                   @change="toggleOwnGroup(group.id)"
                 />
                 <span class="text-sm text-foreground">{{ group.groupName }}</span>
                 <span v-if="group.platform" class="inline-flex rounded-md border border-border/50 bg-surface-elevated px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                   {{ group.platform }}
                 </span>
+                <span v-if="isRecommendedOwnGroup(group)" class="inline-flex rounded-md border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                  {{ t('admin.groupRates.connect.recommendedTag') }}
+                </span>
                 <span class="ml-auto text-xs text-muted-foreground">{{ formatMultiplier(group.multiplier) }}</span>
               </label>
               <div v-if="filteredOwnGroups.length === 0" class="px-4 py-3 text-sm text-muted-foreground">
-                {{ t('admin.groupRates.connect.ownGroupPlaceholder') }}
+                {{ ownGroupEmptyText }}
               </div>
+            </div>
+            <p v-if="usesOwnGroupProtocol && effectiveGroupType" class="text-xs leading-5 text-muted-foreground">
+              {{ t('admin.groupRates.connect.protocolFromGroupHint', { protocol: effectiveGroupTypeName }) }}
+            </p>
+            <div v-if="isProtocolOutsideInference" role="status" class="flex items-start gap-2 rounded-lg border border-warning/20 bg-warning/10 px-3 py-2 text-xs leading-5 text-warning">
+              <AlertCircle class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{{ t('admin.groupRates.connect.protocolOutsideInference', { protocol: effectiveGroupTypeName, vendors: connectingGroupType }) }}</span>
             </div>
           </div>
 

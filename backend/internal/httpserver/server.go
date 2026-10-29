@@ -278,8 +278,8 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 		if err != nil {
 			return
 		}
-		checkBalanceWarning(ctx, settingsService, upstreamService, strategy, userID, siteID, siteName, oldMetrics, newMetrics)
-		checkMultiplierChanges(ctx, settingsService, strategy, userID, siteID, siteName, oldMetrics, newMetrics)
+		checkBalanceWarning(ctx, settingsService, upstreamService, strategy, userID, adminAccountID, siteID, siteName, oldMetrics, newMetrics)
+		checkMultiplierChanges(ctx, settingsService, strategy, userID, adminAccountID, siteID, siteName, oldMetrics, newMetrics)
 		// 自动调价：分组级 enableAutoPricing 是唯一开关，Service 内部逐 mapping 判断。
 		mySitesService.ApplyAutoPricingAfterSync(ctx, userID, adminAccountID, siteID, siteName, oldMetrics, newMetrics)
 	}
@@ -595,7 +595,8 @@ const balanceAlertCooldown = 1 * time.Hour
 // checkBalanceWarning 检测余额是否低于阈值并发送通知。
 // 采用冷却机制：首次低于阈值立即通知，之后在冷却期内不再重复；冷却期过后若仍低于阈值再次通知。
 // 优先使用站点级 BalanceThreshold 覆盖全局 DefaultBalanceThreshold；站点设置为 nil 时降级到全局。
-func checkBalanceWarning(ctx context.Context, svc *settings.Service, uSvc *upstream.Service, strategy settings.StrategySettings, userID, siteID, siteName string, _ /* oldMetrics */, newMetrics upstream.Metrics) {
+// 通知按同步所属工作区发送，不能依赖用户当前选中的工作区。
+func checkBalanceWarning(ctx context.Context, svc *settings.Service, uSvc *upstream.Service, strategy settings.StrategySettings, userID, adminAccountID, siteID, siteName string, _ /* oldMetrics */, newMetrics upstream.Metrics) {
 	if !strategy.EnableBalanceWarning || len(strategy.BalanceNotifyBotIDs) == 0 {
 		return
 	}
@@ -640,12 +641,12 @@ func checkBalanceWarning(ctx context.Context, svc *settings.Service, uSvc *upstr
 
 	msg := formatBalanceWarning(siteName, newBalCNY, threshold, strategy.BalanceTemplate)
 	log.Printf("[alert] 余额预警触发 site=%s balanceCNY=%.2f threshold=%.2f rechargeRate=%.2f", siteName, newBalCNY, threshold, rechargeRate)
-	svc.SendFormattedToBots(ctx, userID, strategy.BalanceNotifyBotIDs, msg, strategy.BalanceTemplateFormat)
+	svc.SendFormattedToBotsForWorkspace(ctx, userID, adminAccountID, strategy.BalanceNotifyBotIDs, msg, strategy.BalanceTemplateFormat)
 }
 
 // checkMultiplierChanges 对比同步前后的分组倍率，任何变化都发送通知。
-// 只受系统设置全局开关 strategy.EnableMultiplierAlert 控制。
-func checkMultiplierChanges(ctx context.Context, svc *settings.Service, strategy settings.StrategySettings, userID, siteID, siteName string, oldMetrics, newMetrics upstream.Metrics) {
+// 只受系统设置全局开关 strategy.EnableMultiplierAlert 控制；通知按同步所属工作区发送。
+func checkMultiplierChanges(ctx context.Context, svc *settings.Service, strategy settings.StrategySettings, userID, adminAccountID, siteID, siteName string, oldMetrics, newMetrics upstream.Metrics) {
 	_ = siteID
 	if !strategy.EnableMultiplierAlert || len(strategy.MultiplierNotifyBotIDs) == 0 {
 		return
@@ -670,7 +671,7 @@ func checkMultiplierChanges(ctx context.Context, svc *settings.Service, strategy
 		}
 		msg := formatMultiplierChange(siteName, g.Name, oldVal, *g.Multiplier, strategy.MultiplierTemplate)
 		log.Printf("[alert] 倍率变更触发 site=%s group=%s old=%.4f new=%.4f", siteName, g.Name, oldVal, *g.Multiplier)
-		svc.SendFormattedToBots(ctx, userID, strategy.MultiplierNotifyBotIDs, msg, strategy.MultiplierTemplateFormat)
+		svc.SendFormattedToBotsForWorkspace(ctx, userID, adminAccountID, strategy.MultiplierNotifyBotIDs, msg, strategy.MultiplierTemplateFormat)
 	}
 }
 

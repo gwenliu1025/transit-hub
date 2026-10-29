@@ -3,6 +3,7 @@ package group_rate_campaigns
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,13 +42,25 @@ func (f *fakeOperator) UpdateAdminGroupMultiplier(session upstream.Session, grou
 	return f.updateErr
 }
 
-// fakeNotifier 记录发送次数，用于断言 Preview 从不发送通知。
+// fakeNotifier 记录发送次数和每次发送的目标工作区/内容，用于断言通知次数与工作区。
 type fakeNotifier struct {
-	calls int
+	calls    int
+	sent     []sentNotification
+	ctxErrs  []error
+	messages []string
 }
 
-func (f *fakeNotifier) SendToBots(ctx context.Context, userID string, botIDs []string, message string) {
+type sentNotification struct {
+	userID         string
+	adminAccountID string
+	botIDs         []string
+}
+
+func (f *fakeNotifier) SendToBotsForWorkspace(ctx context.Context, userID string, adminAccountID string, botIDs []string, message string) {
 	f.calls++
+	f.sent = append(f.sent, sentNotification{userID: userID, adminAccountID: adminAccountID, botIDs: botIDs})
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
+	f.messages = append(f.messages, message)
 }
 
 // fakeTypeLookup 是 GroupTypeLookup 的测试替身，按预设的 type/search/platform 返回固定分组名。
@@ -74,10 +87,24 @@ func (f *fakeTypeLookup) ListGroupNames(ctx context.Context, userID string, admi
 type fakeRepository struct {
 	campaigns map[string]*Campaign
 	items     map[string][]*CampaignItem
+	// endAttempts / nextEndRetry / claimedAt 模拟 end_attempts、next_end_retry_at 与 ending 抢占时的 updated_at。
+	endAttempts  map[string]int
+	nextEndRetry map[string]*time.Time
+	claimedAt    map[string]time.Time
+	// ctxErrs 记录每次写入时的 ctx 状态，用于断言执行已与调用方取消信号解绑。
+	ctxErrs []error
+	// onUpdateItemApply 在开启写入单个分组结果后回调，用于模拟开启期间的并发动作。
+	onUpdateItemApply func()
 }
 
 func newFakeRepository() *fakeRepository {
-	return &fakeRepository{campaigns: map[string]*Campaign{}, items: map[string][]*CampaignItem{}}
+	return &fakeRepository{
+		campaigns:    map[string]*Campaign{},
+		items:        map[string][]*CampaignItem{},
+		endAttempts:  map[string]int{},
+		nextEndRetry: map[string]*time.Time{},
+		claimedAt:    map[string]time.Time{},
+	}
 }
 
 func (f *fakeRepository) EnsureSchema(ctx context.Context) error { return nil }
@@ -110,6 +137,7 @@ func (f *fakeRepository) findItem(id string) *CampaignItem {
 }
 
 func (f *fakeRepository) UpdateItemApply(ctx context.Context, id string, originalMultiplier *float64, status string, reason string, appliedAt *time.Time) error {
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	item := f.findItem(id)
 	if item == nil {
 		return nil
@@ -118,10 +146,14 @@ func (f *fakeRepository) UpdateItemApply(ctx context.Context, id string, origina
 	item.ApplyStatus = status
 	item.ApplyReason = reason
 	item.AppliedAt = appliedAt
+	if f.onUpdateItemApply != nil {
+		f.onUpdateItemApply()
+	}
 	return nil
 }
 
 func (f *fakeRepository) UpdateItemRestore(ctx context.Context, id string, restoredMultiplier *float64, status string, reason string, restoredAt *time.Time) error {
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	item := f.findItem(id)
 	if item == nil {
 		return nil
@@ -174,15 +206,33 @@ func (f *fakeRepository) ListDueScheduled(ctx context.Context, now time.Time) ([
 	return ids, nil
 }
 
-// ListDueRunning mirrors the fixed repository.go query: it must scan both running and
-// partial campaigns, since a partial campaign can still hold applied-but-not-restored items.
+// ListDueRunning mirrors listDueRunningSQL: it must scan both running and partial campaigns,
+// since a partial campaign can still hold applied-but-not-restored items, but it skips
+// campaigns whose retry backoff has not elapsed or whose end attempts are exhausted.
 func (f *fakeRepository) ListDueRunning(ctx context.Context, now time.Time) ([]string, error) {
 	ids := make([]string, 0)
 	for id, c := range f.campaigns {
 		if c.Status != StatusRunning && c.Status != StatusPartial {
 			continue
 		}
+		if f.endAttempts[id] >= maxEndAttempts {
+			continue
+		}
+		if retryAt := f.nextEndRetry[id]; retryAt != nil && retryAt.After(now) {
+			continue
+		}
 		if c.EndMode == EndScheduled && c.EndAt != nil && !c.EndAt.After(now) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// ListStuckEnding mirrors listStuckEndingSQL using the time the campaign was claimed for ending.
+func (f *fakeRepository) ListStuckEnding(ctx context.Context, staleBefore time.Time) ([]string, error) {
+	ids := make([]string, 0)
+	for id, c := range f.campaigns {
+		if c.Status == StatusEnding && !f.claimedAt[id].After(staleBefore) {
 			ids = append(ids, id)
 		}
 	}
@@ -200,30 +250,52 @@ func (f *fakeRepository) ClaimForRunning(ctx context.Context, id string) (bool, 
 	return true, nil
 }
 
-// ClaimForEnding mirrors the fixed repository.go query: running and partial campaigns
-// can both be claimed for the ending/restore path.
-func (f *fakeRepository) ClaimForEnding(ctx context.Context, id string) (bool, error) {
+// ClaimForEnding mirrors claimForEndingSQL: running and partial campaigns can both be
+// claimed for the ending/restore path, and each claim counts as one end attempt.
+func (f *fakeRepository) ClaimForEnding(ctx context.Context, id string) (int, bool, error) {
 	c, ok := f.campaigns[id]
 	if !ok || (c.Status != StatusRunning && c.Status != StatusPartial) {
-		return false, nil
+		return 0, false, nil
 	}
 	c.Status = StatusEnding
+	f.endAttempts[id]++
+	f.claimedAt[id] = time.Now()
+	return f.endAttempts[id], true, nil
+}
+
+// ClaimStuckEnding mirrors claimStuckEndingSQL.
+func (f *fakeRepository) ClaimStuckEnding(ctx context.Context, id string, staleBefore time.Time) (int, bool, error) {
+	c, ok := f.campaigns[id]
+	if !ok || c.Status != StatusEnding || f.claimedAt[id].After(staleBefore) {
+		return 0, false, nil
+	}
+	f.endAttempts[id]++
+	f.claimedAt[id] = time.Now()
+	return f.endAttempts[id], true, nil
+}
+
+// FinishStart mirrors finishStartSQL: only a campaign still in running can be finished.
+func (f *fakeRepository) FinishStart(ctx context.Context, id string, status string) (bool, error) {
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
+	c, ok := f.campaigns[id]
+	if !ok || c.Status != StatusRunning {
+		return false, nil
+	}
+	c.Status = status
 	return true, nil
 }
 
-func (f *fakeRepository) FinishStart(ctx context.Context, id string, status string) error {
-	if c, ok := f.campaigns[id]; ok {
-		c.Status = status
+// FinishEnd mirrors finishEndSQL: only a campaign still in ending can be finished.
+func (f *fakeRepository) FinishEnd(ctx context.Context, id string, status string, nextRetryAt *time.Time) error {
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
+	c, ok := f.campaigns[id]
+	if !ok || c.Status != StatusEnding {
+		return nil
 	}
-	return nil
-}
-
-func (f *fakeRepository) FinishEnd(ctx context.Context, id string, status string) error {
-	if c, ok := f.campaigns[id]; ok {
-		c.Status = status
-		now := time.Now()
-		c.EndedAt = &now
-	}
+	c.Status = status
+	now := time.Now()
+	c.EndedAt = &now
+	f.nextEndRetry[id] = nextRetryAt
 	return nil
 }
 
@@ -832,7 +904,7 @@ func TestEndingClaimIsIdempotentForPartialCampaigns(t *testing.T) {
 	operator := &fakeOperator{groups: remoteGroupsAfterPartialStart()}
 	svc := &Service{repository: repo, operator: operator, config: Config{}}
 
-	svc.endCampaign(context.Background(), campaignID)
+	svc.endCampaign(context.Background(), campaignID, endTriggerManual)
 	firstCallCount := operator.updateCalls
 	if firstCallCount != 1 {
 		t.Fatalf("expected the first endCampaign call to restore exactly 1 item, got %d", firstCallCount)
@@ -840,16 +912,357 @@ func TestEndingClaimIsIdempotentForPartialCampaigns(t *testing.T) {
 
 	// The campaign is now "ended", so a second invocation must not re-claim it or
 	// perform any further remote writes, even though nothing prevents it from being called again.
-	svc.endCampaign(context.Background(), campaignID)
+	svc.endCampaign(context.Background(), campaignID, endTriggerScheduler)
 	if operator.updateCalls != firstCallCount {
 		t.Fatalf("expected no additional remote calls on a repeated endCampaign call, got %d (was %d)", operator.updateCalls, firstCallCount)
 	}
 
-	claimed, err := repo.ClaimForEnding(context.Background(), campaignID)
+	_, claimed, err := repo.ClaimForEnding(context.Background(), campaignID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if claimed {
 		t.Fatalf("expected ClaimForEnding to fail once the campaign has already ended")
+	}
+}
+
+// notifyingCampaignFixture 构造一个已到期、开启通知的定时结束活动，只有一个已改价待恢复的分组 vip。
+func notifyingCampaignFixture(status string) (*fakeRepository, string) {
+	repo := newFakeRepository()
+	campaignID := "campaign-notify"
+	due := time.Now().Add(-time.Minute)
+	repo.campaigns[campaignID] = &Campaign{
+		ID:             campaignID,
+		UserID:         "user1",
+		AdminAccountID: "workspace-a",
+		Name:           "notify activity",
+		Status:         status,
+		EndMode:        EndScheduled,
+		EndAt:          &due,
+		Notify:         Notify{Enabled: true, BotIDs: []string{"bot-a"}, StartTemplate: "start {activityName}", EndTemplate: "end restored={restoredCount} failed={restoreFailedCount}"},
+	}
+	repo.items[campaignID] = []*CampaignItem{
+		{ID: "item-vip", CampaignID: campaignID, GroupName: "vip", OriginalMultiplier: floatPtr(1.0), ApplyStatus: ItemApplied, RestoreStatus: ItemPending},
+	}
+	return repo, campaignID
+}
+
+// makeEndRetryDue 模拟退避时间已过，让下一轮调度可以再次尝试恢复。
+func makeEndRetryDue(repo *fakeRepository, campaignID string) {
+	past := time.Now().Add(-time.Second)
+	repo.nextEndRetry[campaignID] = &past
+}
+
+// TestSchedulerEndFailureRetriesBoundedAndNotifiesOnce 回归：定时结束恢复失败后，调度器曾每轮重新
+// 抢占 partial 活动并重复发送结束通知。现在失败按退避有界重试，中间失败不通知，重试用尽时只通知一次。
+func TestSchedulerEndFailureRetriesBoundedAndNotifiesOnce(t *testing.T) {
+	repo, campaignID := notifyingCampaignFixture(StatusRunning)
+	operator := &fakeOperator{groups: remoteGroupsAfterPartialStart(), updateErr: errors.New("remote down")}
+	notifier := &fakeNotifier{}
+	svc := &Service{repository: repo, operator: operator, notifier: notifier, config: Config{}}
+
+	svc.runSchedulerTick(context.Background())
+	if repo.campaigns[campaignID].Status != StatusPartial || operator.updateCalls != 1 {
+		t.Fatalf("expected first failed attempt to leave partial after 1 remote call, got status=%q calls=%d", repo.campaigns[campaignID].Status, operator.updateCalls)
+	}
+	if repo.nextEndRetry[campaignID] == nil || !repo.nextEndRetry[campaignID].After(time.Now()) {
+		t.Fatalf("expected a future retry time after the first failure, got %v", repo.nextEndRetry[campaignID])
+	}
+	if notifier.calls != 0 {
+		t.Fatalf("intermediate scheduler failure must not notify, got %d", notifier.calls)
+	}
+
+	// 退避期内的调度轮次不能再次恢复，也不能再发通知。
+	svc.runSchedulerTick(context.Background())
+	if operator.updateCalls != 1 || notifier.calls != 0 {
+		t.Fatalf("expected no retry during backoff, got calls=%d notifications=%d", operator.updateCalls, notifier.calls)
+	}
+
+	for attempt := 2; attempt <= maxEndAttempts; attempt++ {
+		makeEndRetryDue(repo, campaignID)
+		svc.runSchedulerTick(context.Background())
+		if operator.updateCalls != attempt {
+			t.Fatalf("expected retry attempt %d to call remote once, got %d calls", attempt, operator.updateCalls)
+		}
+	}
+	if notifier.calls != 1 {
+		t.Fatalf("expected exactly one end notification once retries are exhausted, got %d", notifier.calls)
+	}
+	if repo.nextEndRetry[campaignID] != nil {
+		t.Fatalf("expected no further retry after the final attempt, got %v", repo.nextEndRetry[campaignID])
+	}
+	if got := notifier.messages[0]; got != "end restored=0 failed=1" {
+		t.Fatalf("unexpected final end notification: %q", got)
+	}
+
+	// 重试用尽后调度器不再处理该活动，也不再重复通知。
+	svc.runSchedulerTick(context.Background())
+	if operator.updateCalls != maxEndAttempts || notifier.calls != 1 {
+		t.Fatalf("expected scheduler to stop after exhausting retries, got calls=%d notifications=%d", operator.updateCalls, notifier.calls)
+	}
+
+	// 用户仍可手动结束；手动结果单独通知一次。
+	operator.updateErr = nil
+	detail, err := svc.End(context.Background(), "user1", "workspace-a", campaignID)
+	if err != nil {
+		t.Fatalf("manual end after exhausted retries failed: %v", err)
+	}
+	if detail.Status != StatusEnded || notifier.calls != 2 {
+		t.Fatalf("expected manual end to restore and notify once, got status=%q notifications=%d", detail.Status, notifier.calls)
+	}
+}
+
+// TestSchedulerEndRetrySuccessNotifiesOnce 验证首轮失败、重试成功时只发送一次"已结束"通知，且发往活动所属工作区。
+func TestSchedulerEndRetrySuccessNotifiesOnce(t *testing.T) {
+	repo, campaignID := notifyingCampaignFixture(StatusPartial)
+	operator := &fakeOperator{groups: remoteGroupsAfterPartialStart(), updateErr: errors.New("remote down")}
+	notifier := &fakeNotifier{}
+	svc := &Service{repository: repo, operator: operator, notifier: notifier, config: Config{}}
+
+	svc.runSchedulerTick(context.Background())
+	operator.updateErr = nil
+	makeEndRetryDue(repo, campaignID)
+	svc.runSchedulerTick(context.Background())
+	svc.runSchedulerTick(context.Background())
+
+	if repo.campaigns[campaignID].Status != StatusEnded {
+		t.Fatalf("expected retry to end the campaign, got %q", repo.campaigns[campaignID].Status)
+	}
+	if notifier.calls != 1 || notifier.messages[0] != "end restored=1 failed=0" {
+		t.Fatalf("expected one success notification, got calls=%d messages=%v", notifier.calls, notifier.messages)
+	}
+	if sent := notifier.sent[0]; sent.userID != "user1" || sent.adminAccountID != "workspace-a" {
+		t.Fatalf("campaign notification must target the campaign workspace, got %+v", sent)
+	}
+}
+
+func TestNextEndRetryAtBackoffIsBounded(t *testing.T) {
+	now := time.Now()
+	if got := nextEndRetryAt(1, now); got == nil || !got.Equal(now.Add(endRetryBaseDelay)) {
+		t.Fatalf("expected first retry after base delay, got %v", got)
+	}
+	if got := nextEndRetryAt(3, now); got == nil || !got.Equal(now.Add(4*endRetryBaseDelay)) {
+		t.Fatalf("expected exponential backoff on the third attempt, got %v", got)
+	}
+	if got := nextEndRetryAt(maxEndAttempts, now); got != nil {
+		t.Fatalf("expected no retry once attempts are exhausted, got %v", got)
+	}
+}
+
+// TestStartSkipsGroupsWithUnknownOriginalMultiplier 回归：New API 分组可能缺倍率，曾被当作 0 记录并改价，
+// 结束时又"恢复"成 0。现在原倍率未知的分组直接标记失败，不改价。
+func TestStartSkipsGroupsWithUnknownOriginalMultiplier(t *testing.T) {
+	repo := newFakeRepository()
+	operator := &fakeOperator{groups: []upstream.AdminGroupInfo{
+		{ID: "g2", Name: "vip", Multiplier: nil},
+		{ID: "g3", Name: "svip", Multiplier: floatPtr(3.0)},
+	}}
+	svc := &Service{repository: repo, operator: operator, config: Config{}}
+
+	detail, err := svc.Create(context.Background(), "user1", "account1", CreateCampaignRequest{
+		Name: "nil original",
+		Selection: Selection{Mode: SelectionManual, Groups: []SelectionGroupRef{
+			{GroupName: "vip", CampaignMultiplier: floatPtr(0.5)},
+			{GroupName: "svip", CampaignMultiplier: floatPtr(0.9)},
+		}},
+		Adjustment: Adjustment{Mode: AdjustmentSet, Value: 0},
+		Schedule:   Schedule{StartMode: StartNow, EndMode: EndManual},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if detail.Status != StatusPartial {
+		t.Fatalf("expected partial start when one group lacks an original multiplier, got %q", detail.Status)
+	}
+	if len(operator.updates) != 1 || operator.updates[0].groupName != "svip" {
+		t.Fatalf("expected only svip to be changed remotely, got %+v", operator.updates)
+	}
+	for _, item := range repo.items[detail.ID] {
+		if item.GroupName == "vip" && (item.ApplyStatus != ItemFailed || item.ApplyReason != reasonOriginalMultiplierUnavailable || item.OriginalMultiplier != nil) {
+			t.Fatalf("expected vip item to fail with unknown original multiplier, got %+v", item)
+		}
+	}
+}
+
+// TestEndNeverRestoresUnknownOriginalAndRestoresWhenCurrentUnknown 覆盖结束阶段的两种 nil：
+// 原倍率未知（历史数据）绝不恢复成 0；当前倍率未知时必须真实恢复，不能误判为 unchanged。
+func TestEndNeverRestoresUnknownOriginalAndRestoresWhenCurrentUnknown(t *testing.T) {
+	repo := newFakeRepository()
+	campaignID := "campaign-nil"
+	repo.campaigns[campaignID] = &Campaign{ID: campaignID, UserID: "user1", AdminAccountID: "account1", Status: StatusRunning, EndMode: EndManual}
+	repo.items[campaignID] = []*CampaignItem{
+		{ID: "item-legacy-nil", CampaignID: campaignID, GroupName: "vip", OriginalMultiplier: nil, CampaignMultiplier: 0.5, ApplyStatus: ItemApplied, RestoreStatus: ItemPending},
+		{ID: "item-free", CampaignID: campaignID, GroupName: "free", OriginalMultiplier: floatPtr(0), CampaignMultiplier: 0.3, ApplyStatus: ItemApplied, RestoreStatus: ItemPending},
+	}
+	operator := &fakeOperator{groups: []upstream.AdminGroupInfo{
+		{ID: "g2", Name: "vip", Multiplier: floatPtr(0.5)},
+		{ID: "g4", Name: "free", Multiplier: nil},
+	}}
+	svc := &Service{repository: repo, operator: operator, config: Config{}}
+
+	detail, err := svc.End(context.Background(), "user1", "account1", campaignID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if detail.Status != StatusPartial {
+		t.Fatalf("expected partial because the legacy item cannot be restored, got %q", detail.Status)
+	}
+	if len(operator.updates) != 1 || operator.updates[0].groupName != "free" || operator.updates[0].multiplier != 0 {
+		t.Fatalf("expected only free to be restored to 0 and vip untouched, got %+v", operator.updates)
+	}
+	byID := map[string]*CampaignItem{}
+	for _, item := range repo.items[campaignID] {
+		byID[item.ID] = item
+	}
+	if item := byID["item-legacy-nil"]; item.RestoreStatus != ItemFailed || item.RestoreReason != reasonOriginalMultiplierUnavailable {
+		t.Fatalf("expected legacy nil-original item to fail restore, got %+v", item)
+	}
+	if item := byID["item-free"]; item.RestoreStatus != ItemRestored {
+		t.Fatalf("expected free item to be restored when current multiplier is unknown, got %+v", item)
+	}
+}
+
+// TestEndIgnoresCallerCancellation 回归：开启/结束曾绑定 HTTP 请求 ctx，客户端断开后落库失败，
+// 分组停在 pending 或活动卡在 ending。现在执行与调用方取消解绑。
+func TestEndIgnoresCallerCancellation(t *testing.T) {
+	repo, campaignID := notifyingCampaignFixture(StatusRunning)
+	operator := &fakeOperator{groups: remoteGroupsAfterPartialStart()}
+	notifier := &fakeNotifier{}
+	svc := &Service{repository: repo, operator: operator, notifier: notifier, config: Config{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := svc.End(ctx, "user1", "workspace-a", campaignID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if repo.campaigns[campaignID].Status != StatusEnded {
+		t.Fatalf("expected campaign to end despite caller cancellation, got %q", repo.campaigns[campaignID].Status)
+	}
+	for i, ctxErr := range append(append([]error{}, repo.ctxErrs...), notifier.ctxErrs...) {
+		if ctxErr != nil {
+			t.Fatalf("execution write #%d saw caller cancellation: %v", i, ctxErr)
+		}
+	}
+	if len(repo.ctxErrs) == 0 || len(notifier.ctxErrs) != 1 {
+		t.Fatalf("expected restore writes and one notification, got writes=%d notifications=%d", len(repo.ctxErrs), len(notifier.ctxErrs))
+	}
+}
+
+// TestSchedulerRecoversStuckEndingCampaign 验证卡在 ending 超过阈值的活动会被调度器重新接管恢复，
+// 刚进入 ending 的活动（可能仍在执行）不受影响。
+func TestSchedulerRecoversStuckEndingCampaign(t *testing.T) {
+	repo, campaignID := notifyingCampaignFixture(StatusEnding)
+	repo.endAttempts[campaignID] = 1
+	repo.claimedAt[campaignID] = time.Now().Add(-stuckEndingAfter - time.Minute)
+	repo.campaigns["campaign-fresh"] = &Campaign{ID: "campaign-fresh", UserID: "user1", AdminAccountID: "workspace-a", Status: StatusEnding, EndMode: EndManual}
+	repo.claimedAt["campaign-fresh"] = time.Now()
+	operator := &fakeOperator{groups: remoteGroupsAfterPartialStart()}
+	notifier := &fakeNotifier{}
+	svc := &Service{repository: repo, operator: operator, notifier: notifier, config: Config{}}
+
+	svc.runSchedulerTick(context.Background())
+
+	if repo.campaigns[campaignID].Status != StatusEnded || operator.updateCalls != 1 {
+		t.Fatalf("expected stuck campaign to be restored, got status=%q calls=%d", repo.campaigns[campaignID].Status, operator.updateCalls)
+	}
+	if repo.endAttempts[campaignID] != 2 || notifier.calls != 1 {
+		t.Fatalf("expected recovery to count as a new attempt and notify once, got attempts=%d notifications=%d", repo.endAttempts[campaignID], notifier.calls)
+	}
+	if repo.campaigns["campaign-fresh"].Status != StatusEnding {
+		t.Fatalf("a recently claimed ending campaign must not be taken over, got %q", repo.campaigns["campaign-fresh"].Status)
+	}
+}
+
+// TestFinishStartDoesNotOverwriteConcurrentEnd 回归：开启执行期间活动被（其它进程）抢占结束时，
+// FinishStart 曾无条件把状态覆盖回 running。
+func TestFinishStartDoesNotOverwriteConcurrentEnd(t *testing.T) {
+	repo := newFakeRepository()
+	operator := &fakeOperator{groups: adminGroups()}
+	svc := &Service{repository: repo, operator: operator, config: Config{}}
+	campaignID := "campaign-race"
+	repo.campaigns[campaignID] = &Campaign{
+		ID: campaignID, UserID: "user1", AdminAccountID: "account1", Status: StatusScheduled, EndMode: EndManual,
+		Selection: Selection{Mode: SelectionManual, Groups: []SelectionGroupRef{{GroupName: "vip", CampaignMultiplier: floatPtr(0.6)}}},
+	}
+	repo.onUpdateItemApply = func() {
+		repo.onUpdateItemApply = nil
+		if _, claimed, _ := repo.ClaimForEnding(context.Background(), campaignID); !claimed {
+			t.Errorf("expected concurrent end claim to succeed while starting")
+		}
+	}
+
+	svc.startCampaign(context.Background(), campaignID)
+
+	if got := repo.campaigns[campaignID].Status; got != StatusEnding {
+		t.Fatalf("FinishStart must not overwrite a concurrent end, got status %q", got)
+	}
+}
+
+// blockingOperator 在第一次远端改价时阻塞，模拟开启执行进行到一半。
+type blockingOperator struct {
+	*fakeOperator
+	started chan struct{}
+	release chan struct{}
+	blocked bool
+}
+
+func (b *blockingOperator) UpdateAdminGroupMultiplier(session upstream.Session, group upstream.AdminGroupInfo, multiplier float64) error {
+	if !b.blocked {
+		b.blocked = true
+		close(b.started)
+		<-b.release
+	}
+	return b.fakeOperator.UpdateAdminGroupMultiplier(session, group, multiplier)
+}
+
+// TestEndDuringStartWaitsAndRestoresAllAppliedGroups 验证开启尚未完成时到来的结束会等待开启落定，
+// 从而恢复全部已改价分组，不会遗留停在活动倍率的分组。
+func TestEndDuringStartWaitsAndRestoresAllAppliedGroups(t *testing.T) {
+	repo := newFakeRepository()
+	operator := &blockingOperator{fakeOperator: &fakeOperator{groups: adminGroups()}, started: make(chan struct{}), release: make(chan struct{})}
+	svc := &Service{repository: repo, operator: operator, config: Config{}}
+	campaignID := "campaign-serial"
+	repo.campaigns[campaignID] = &Campaign{
+		ID: campaignID, UserID: "user1", AdminAccountID: "account1", Status: StatusScheduled, EndMode: EndManual,
+		Selection: Selection{Mode: SelectionManual, Groups: []SelectionGroupRef{
+			{GroupName: "vip", CampaignMultiplier: floatPtr(0.6)},
+			{GroupName: "svip", CampaignMultiplier: floatPtr(0.9)},
+		}},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		svc.startCampaign(context.Background(), campaignID)
+	}()
+	<-operator.started
+	go func() {
+		defer wg.Done()
+		svc.endCampaign(context.Background(), campaignID, endTriggerManual)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(operator.release)
+	wg.Wait()
+
+	if got := repo.campaigns[campaignID].Status; got != StatusEnded {
+		t.Fatalf("expected end to run after start and finish as ended, got %q", got)
+	}
+	// fake 分组倍率不随改价变化，恢复阶段会判定为 unchanged；关键是每个已改价分组都被结束流程处理过，
+	// 不会因为结束先于开启落定而遗留 restore_status=pending 的分组。
+	if len(repo.items[campaignID]) != 2 {
+		t.Fatalf("expected both groups to be recorded, got %d", len(repo.items[campaignID]))
+	}
+	for _, item := range repo.items[campaignID] {
+		if item.ApplyStatus != ItemApplied || (item.RestoreStatus != ItemRestored && item.RestoreStatus != ItemUnchanged) {
+			t.Fatalf("expected every applied group to be handled by end, got %+v", item)
+		}
+	}
+}
+
+func TestFormatTimeUsesBeijingTime(t *testing.T) {
+	value := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if got := formatTime(&value); got != "2026-01-02 11:04:05" {
+		t.Fatalf("expected notification time in Asia/Shanghai, got %q", got)
 	}
 }

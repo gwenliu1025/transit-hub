@@ -38,7 +38,8 @@ func TestMetricsRepositoryListRange_BeijingDatesAndWorkspace(t *testing.T) {
 				today_profit double precision DEFAULT 1, site_balance double precision DEFAULT 2,
 				today_purchase double precision DEFAULT 3, net_profit double precision DEFAULT 4,
 				upstream_balance double precision DEFAULT 5, created_at timestamptz DEFAULT now(),
-				revenue_complete boolean DEFAULT false, purchase_complete boolean DEFAULT false, balance_recorded boolean DEFAULT true
+				revenue_complete boolean DEFAULT false, purchase_complete boolean DEFAULT false, balance_recorded boolean DEFAULT true,
+				purchase_recorded boolean DEFAULT true
 			)`)
 			if err != nil {
 				t.Fatal(err)

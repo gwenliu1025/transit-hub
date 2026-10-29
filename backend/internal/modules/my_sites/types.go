@@ -16,6 +16,12 @@ const (
 	ErrorGroupTypeRequired      = "admin.mySites.errors.groupTypeRequired"
 	ErrorGroupTypeInvalid       = "admin.mySites.errors.groupTypeInvalid"
 	ErrorManagedDeleteOnly      = "admin.mySites.errors.managedDeleteOnly"
+	// 所选自有分组平台与账号协议不一致，或混用了不同平台。
+	ErrorOwnGroupPlatformMismatch = "admin.mySites.errors.ownGroupPlatformMismatch"
+	// New API 管理端创建渠道必须显式给出渠道类型，不再静默回退为 OpenAI。
+	ErrorChannelTypeRequired = "admin.mySites.errors.channelTypeRequired"
+	// 同一上游分组正在创建或关联中，避免并发请求重复创建远端资源。
+	ErrorConnectionInProgress = "admin.mySites.errors.connectionInProgress"
 )
 
 const (
@@ -223,6 +229,13 @@ type AdminResourceOption struct {
 	Status   string   `json:"status"`
 	Platform string   `json:"platform"`
 	GroupIDs []string `json:"groupIds"`
+}
+
+// UpstreamGroupProtocolResponse 返回后端创建账号时实际依据的上游分组平台缓存，
+// 不受分组倍率页“编辑类型”影响；New API 上游的 GroupType 为排序后的厂商列表。
+type UpstreamGroupProtocolResponse struct {
+	UpstreamPlatform string `json:"upstreamPlatform"`
+	GroupType        string `json:"groupType"`
 }
 
 // RealConnectResponse 真实对接成功后返回的绑定记录。

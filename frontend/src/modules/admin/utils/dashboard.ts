@@ -38,7 +38,10 @@ const cnyFormatter = new Intl.NumberFormat('en-US', {
 /** 格式化为人民币显示，空值返回占位符。 */
 export function formatCny(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return '¥—'
-  return `¥${cnyFormatter.format(value)}`
+  // 负数显示为 -¥17.00；四舍五入后为 0 的微小负数不显示负号。
+  const cents = Math.round(value * 100) / 100
+  if (cents < 0) return `-¥${cnyFormatter.format(-cents)}`
+  return `¥${cnyFormatter.format(Math.abs(cents))}`
 }
 
 /** 把毫秒时间戳格式化为可读时间；空值或非数字返回 null，由调用方回退「未知」文案。 */
@@ -62,7 +65,8 @@ export interface DeltaResult {
 /** 计算序列最后一个点相对前一个点的变化（今日 vs 昨日）。 */
 export function computeDelta(values: number[]): DeltaResult {
   if (values.length < 2) return { amount: 0, direction: 'flat' }
-  const amount = values[values.length - 1] - values[values.length - 2]
+  // 先按分取整再判断方向，避免 0.1+0.2 对比 0.3 这类浮点误差显示成“↗¥0.00”。
+  const amount = Math.round((values[values.length - 1] - values[values.length - 2]) * 100) / 100
   const direction: DeltaDirection = amount > 0 ? 'up' : amount < 0 ? 'down' : 'flat'
-  return { amount, direction }
+  return { amount: amount === 0 ? 0 : amount, direction }
 }

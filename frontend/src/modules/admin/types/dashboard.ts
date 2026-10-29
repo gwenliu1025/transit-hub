@@ -35,7 +35,11 @@ export interface DashboardMetricData {
   color: DashboardColorToken
   /** 当前值（“今天”的数值），即月序列最后一个点。 */
   current: number
+  /** 当前值是否可信；实时读取失败（如站点余额拉取失败）时为 false，页面显示未知而不是 0。 */
+  currentKnown: boolean
   /** 北京时间昨日与今日的日对比；昨日缺失或未确认时仅含今日，不随自然周或自然月截断。 */
   comparison: (TrendPoint & { value: number })[]
   series: MetricSeries
+  /** 最近几个完整自然日（不含今天）的历史值，供预计续航等不随周期切换的估算使用。 */
+  recent: TrendPoint[]
 }

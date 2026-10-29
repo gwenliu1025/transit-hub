@@ -11,6 +11,10 @@ type MetricsResponse struct {
 	NetProfit       float64 `json:"netProfit"`       // 今日净利润：todayProfit - todayPurchase
 	UpstreamBalance float64 `json:"upstreamBalance"` // 上游总余额：所有上游站点余额（CNY）之和
 	GroupCount      int     `json:"groupCount"`      // 管理员站点分组总数，省去前端单独请求
+	// Date 是本次实时值所属的北京业务日，前端以它为“今天”，不依赖浏览器时钟。
+	Date string `json:"date"`
+	// BalanceRecorded 为 false 表示站点用户余额读取失败，SiteBalance 的 0 只是占位。
+	BalanceRecorded bool `json:"balanceRecorded"`
 }
 
 // TrendResponse 是 GET /api/dashboard/trends 返回的历史趋势数据。
@@ -20,8 +24,10 @@ type TrendResponse struct {
 
 // TrendPoint 代表一天的指标快照，用于趋势图渲染。
 type TrendPoint struct {
-	RevenueComplete  bool    `json:"revenueComplete"`
-	PurchaseComplete bool    `json:"purchaseComplete"`
+	RevenueComplete  bool `json:"revenueComplete"`
+	PurchaseComplete bool `json:"purchaseComplete"`
+	// PurchaseRecorded 表示该日成本有真实来源（日内采样或部分日结）；为 false 且未完成时成本未知，不能当 0 展示。
+	PurchaseRecorded bool    `json:"purchaseRecorded"`
 	BalanceRecorded  bool    `json:"balanceRecorded"`
 	Date             string  `json:"date"` // 日期，格式 "2006-01-02"
 	TodayProfit      float64 `json:"todayProfit"`
@@ -39,16 +45,21 @@ type DailySnapshot struct {
 	RevenueComplete  bool
 	PurchaseComplete bool
 	BalanceRecorded  bool
-	ID               string
-	UserID           string
-	AdminAccountID   string
-	Date             time.Time
-	TodayProfit      float64
-	SiteBalance      float64
-	TodayPurchase    float64
-	NetProfit        float64
-	UpstreamBalance  float64
-	CreatedAt        time.Time
+	// PurchaseRecorded 表示 TodayPurchase 携带真实数据（日内采样或部分日结），而不是建行时的默认 0。
+	PurchaseRecorded bool
+	// 以下两项只控制写入，不落库：Settlement 标记历史日结写入；PurchaseSampleOnly 表示后台成本采样，不改营收。
+	Settlement         bool
+	PurchaseSampleOnly bool
+	ID                 string
+	UserID             string
+	AdminAccountID     string
+	Date               time.Time
+	TodayProfit        float64
+	SiteBalance        float64
+	TodayPurchase      float64
+	NetProfit          float64
+	UpstreamBalance    float64
+	CreatedAt          time.Time
 }
 
 // AdminGroupsResponse 是 GET /api/dashboard/groups 返回的管理员站点分组数据。

@@ -41,6 +41,7 @@ func TestWorkspaceDeleteStatementsCoverAllWorkspaceTables(t *testing.T) {
 		"email_templates",
 		"my_site_states",
 		"real_connections",
+		"real_connection_operations",
 		"dashboard_daily_stats",
 		"dashboard_balance_filter",
 		"upstream_sites",
@@ -65,7 +66,7 @@ func TestWorkspaceDeleteStatementsCoverAllWorkspaceTables(t *testing.T) {
 			t.Fatalf("%s delete is not scoped by user_id: %s", table, sql)
 		}
 		workspaceColumn := "admin_account_id = $2"
-		if table == "real_connections" {
+		if table == "real_connections" || table == "real_connection_operations" {
 			workspaceColumn = "workspace_admin_account_id = $2"
 		}
 		if !strings.Contains(sql, workspaceColumn) {
@@ -79,7 +80,15 @@ func TestLegacyWorkspaceDescriptorsCoverDeleteTables(t *testing.T) {
 	for _, table := range legacyWorkspaceTables {
 		descriptors[table.Name] = table.WorkspaceColumn
 	}
+	// real_connection_operations 创建时总带工作区（列无默认值），没有需要迁移归属的旧行。
+	noLegacyRows := map[string]bool{"real_connection_operations": true}
 	for _, stmt := range workspaceDeleteStatements {
+		if noLegacyRows[stmt.Name] {
+			if _, ok := descriptors[stmt.Name]; ok {
+				t.Fatalf("%s must not join legacy workspace assignment", stmt.Name)
+			}
+			continue
+		}
 		column, ok := descriptors[stmt.Name]
 		if !ok {
 			t.Fatalf("legacy workspace descriptor missing for delete table %s", stmt.Name)

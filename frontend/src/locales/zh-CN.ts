@@ -424,7 +424,7 @@ export default {
         month: '本月'
       },
       delta: {
-        vsPrev: '较前一日',
+        vsPrev: '较昨日全天',
         missingYesterday: '缺少昨日数据',
         percentagePoints: '{value} 个百分点'
       },
@@ -435,6 +435,7 @@ export default {
         title: '经营表现',
         subtitle: '按北京时间统计本周（周一至今）或本月（1 日至今）的营收、成本与净利润',
         incomplete: '数据不完整',
+        missingDays: '{count} 天未记录，未计入',
         periodRevenue: '周期营收',
         periodCost: '周期成本',
         periodProfit: '周期净利润',
@@ -448,7 +449,7 @@ export default {
         coverage: '余额覆盖率',
         coverageHint: '上游余额相对于站点用户余额的覆盖比例',
         runway: '预计续航',
-        runwayHint: '按当前周期日均成本估算',
+        runwayHint: '按最近 7 个完整日的日均成本估算',
         runwayValue: '{value} 天'
       },
       groups: {
@@ -1626,6 +1627,13 @@ export default {
         description: '选择由系统创建资源，或关联两端已经存在的资源。',
         ownGroupLabel: '我的站点分组',
         ownGroupPlaceholder: '请选择我的站点分组',
+        ownGroupEmpty: '我的站点暂无可用于创建的分组。',
+        ownGroupNeedProtocol: '请先选择创建账号使用的协议，再选择我的站点分组。',
+        ownGroupEmptyForProtocol: '我的站点没有 {protocol} 平台的分组。',
+        ownGroupFirstHint: '先选择我的站点分组，账号协议将跟随分组平台；标注“推荐”的分组与上游声明的模型厂商一致。',
+        recommendedTag: '推荐',
+        protocolFromGroupHint: '将以 {protocol} 协议创建账号。',
+        protocolOutsideInference: '上游分组声明的模型厂商为 {vendors}，不包含 {protocol}，请确认该分组确实支持此协议。',
         upstreamGroupLabel: '对接分组',
         upstreamGroupPlaceholder: '请选择对接分组',
         upstreamSiteLabel: '上游站点',
@@ -1677,6 +1685,9 @@ export default {
           connectionExists: '该上游分组已有连接，请先查看现有连接。',
           groupTypeRequired: '请选择创建账号使用的协议，模型厂商列表不等于对接协议。',
           groupTypeInvalid: '所选协议不在当前管理端支持列表内，请重新读取能力并选择。',
+          ownGroupPlatformMismatch: '所选我的站点分组与账号协议的平台不一致，或混用了不同平台的分组。请重新读取后选择同一平台的分组。',
+          channelTypeRequired: '请选择要创建的渠道类型。',
+          connectionInProgress: '该上游分组正在创建或关联中，请稍后刷新查看结果，避免重复创建。',
           network: '站点请求发生网络错误。如已提交创建请求，请先核对现有连接和远端资源，避免重复创建。',
           invalidUrl: '对接站点地址未通过校验，请检查协议、主机和端口。',
           remoteAuth: '对接站点认证失败，请检查相关站点的登录状态和权限。',
@@ -1847,7 +1858,10 @@ export default {
       errors: {
         invalidAutoPricingConfig: '自动调价配置无效：主上游不在关联上游中，或最低倍率大于最高倍率。',
         connectionExists: '该上游分组已经存在真实连接。',
-        managedDeleteOnly: '已有资源关联只能取消本地关联，不能删除远端资源。'
+        managedDeleteOnly: '已有资源关联只能取消本地关联，不能删除远端资源。',
+        ownGroupPlatformMismatch: '所选自有分组的平台与账号协议不一致，或混用了不同平台的分组。',
+        channelTypeRequired: '创建 New API 渠道必须指定渠道类型。',
+        connectionInProgress: '该上游分组正在创建或关联中，请稍后再试。'
       }
     },
     tickets: {

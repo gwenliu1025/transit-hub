@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"transithub/backend/internal/modules/my_sites"
+	"transithub/backend/internal/modules/upstream"
 )
 
 // healthRepository 是 Service 对存储层的全部依赖，由 *Repository 结构性满足。
@@ -805,7 +806,8 @@ func (s *Service) ProbeConnection(ctx context.Context, userID string, connection
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.findConnection(ctx, userID, connectionID)
+	// 真实探活需要上游 Key：必须读取未脱敏的工作区连接，ListRealConnections 返回的是已清空 Key 的展示数据。
+	conn, err := s.findConnectionWithCredential(ctx, userID, adminAccountID, connectionID)
 	if err != nil {
 		return nil, err
 	}
@@ -971,6 +973,12 @@ func (s *Service) probeOnce(ctx context.Context, conn my_sites.RealConnection, p
 		current = &defaultState
 	}
 
+	if strings.TrimSpace(conn.UpstreamKey) == "" {
+		// 没有可用上游 Key 时无法真实探活：空 Key 必然得到 401，绝不能当作鉴权失败去暂停链路
+		// 或触发远端降级。记为 unsupported 并跳过，不消耗预算、不驱动状态机。
+		return s.recordConnectionCredentialUnavailable(ctx, conn, policy, target, *current)
+	}
+
 	dayStart := probeBudgetDayStart(time.Now())
 	allowed, err := s.repo.TryConsumeProbeBudget(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart, probeBudgetLimit(policy))
 	if err != nil {
@@ -1050,8 +1058,42 @@ func (s *Service) probeOnce(ctx context.Context, conn my_sites.RealConnection, p
 	return &next, nil
 }
 
+// recordConnectionCredentialUnavailable 只回填 last_probe_at / last_error_key 并写一条 unsupported 事件，
+// 保留当前健康状态与 LastRemoteAction（与独立探活的凭据不可用处理一致）。
+func (s *Service) recordConnectionCredentialUnavailable(ctx context.Context, conn my_sites.RealConnection, policy Policy, target ModelTarget, current ConnectionHealthState) (*ConnectionHealthState, error) {
+	now := time.Now()
+	next := current
+	next.LastProbeAt = &now
+	next.LastErrorKey = upstream.ReasonCredentialUnavailable
+	next.LastErrorDetail = ""
+	next.UserID = policy.UserID
+	next.AdminAccountID = policy.AdminAccountID
+	next.OwnGroupID = policy.OwnGroupID
+	next.OwnGroupName = policy.OwnGroupName
+	if err := s.repo.UpsertState(ctx, next); err != nil {
+		return nil, err
+	}
+	s.recordEvent(ctx, conn, policy.ID, target.ModelName, string(ResultUnsupported), string(current.State), string(next.State), nil, next.LastErrorKey, "", "")
+	return &next, nil
+}
+
 func (s *Service) findConnection(ctx context.Context, userID string, connectionID string) (*my_sites.RealConnection, error) {
 	connections, err := s.mySites.ListRealConnections(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range connections {
+		if c.ID == connectionID {
+			return &c, nil
+		}
+	}
+	return nil, nil
+}
+
+// findConnectionWithCredential 按显式工作区读取未脱敏连接（含上游 Key），仅供真实探活使用；
+// 返回值只在服务端内部使用，绝不能进入任何响应。
+func (s *Service) findConnectionWithCredential(ctx context.Context, userID string, adminAccountID string, connectionID string) (*my_sites.RealConnection, error) {
+	connections, err := s.mySites.ListRealConnectionsForWorkspace(ctx, userID, adminAccountID)
 	if err != nil {
 		return nil, err
 	}

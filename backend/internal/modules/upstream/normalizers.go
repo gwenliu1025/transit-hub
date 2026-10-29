@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -385,6 +386,8 @@ func newAPIGroupPlatforms(pricingPayload any) map[string]*string {
 		for name := range platforms {
 			names = append(names, name)
 		}
+		// map 遍历顺序随机，排序后拼接，保证同一份定价数据每次同步得到相同的类型字符串。
+		sort.Strings(names)
 		value := strings.Join(names, ", ")
 		result[group] = &value
 	}

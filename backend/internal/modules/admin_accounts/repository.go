@@ -65,6 +65,8 @@ var workspaceDeleteStatements = []workspaceDeleteStatement{
 	{Name: "email_templates", SQL: `DELETE FROM email_templates WHERE user_id = $1 AND admin_account_id = $2`},
 	{Name: "my_site_states", SQL: `DELETE FROM my_site_states WHERE user_id = $1 AND admin_account_id = $2`},
 	{Name: "real_connections", SQL: `DELETE FROM real_connections WHERE user_id = $1 AND workspace_admin_account_id = $2`},
+	// 真实对接的幂等/审计记录与连接同属工作区，一并删除，避免残留记录在相同 ID 的工作区重建后阻塞或误判重试。
+	{Name: "real_connection_operations", SQL: `DELETE FROM real_connection_operations WHERE user_id = $1 AND workspace_admin_account_id = $2`},
 	{Name: "dashboard_daily_stats", SQL: `DELETE FROM dashboard_daily_stats WHERE user_id = $1 AND admin_account_id = $2`},
 	{Name: "dashboard_balance_filter", SQL: `DELETE FROM dashboard_balance_filter WHERE user_id = $1 AND admin_account_id = $2`},
 	{Name: "upstream_sites", SQL: `DELETE FROM upstream_sites WHERE user_id = $1 AND admin_account_id = $2`},

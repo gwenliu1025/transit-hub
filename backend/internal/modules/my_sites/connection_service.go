@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,8 +25,17 @@ type connectionContext struct {
 	upstreamSite    *upstream.Site
 	upstreamSession upstream.Session
 	groupType       string
+	// cachedGroupType 是上游站点缓存中该分组的平台（New API 为厂商列表），不读取快照里可编辑的类型。
+	cachedGroupType string
 	groupName       string
 	multiplierLabel string
+}
+
+// ownGroupSelection 是从管理端实时读取、去重并保持请求顺序的自有分组。
+type ownGroupSelection struct {
+	ids       []string
+	names     []string
+	platforms []string
 }
 
 func addToPricingMapping(value *bool) bool {
@@ -105,12 +115,14 @@ func (s *Service) prepareConnectionContext(ctx context.Context, userID, siteID, 
 		return connectionContext{}, requestError(ErrorRequest)
 	}
 
-	groupType, multiplierLabel := resolveGroupInfo(upstreamSite.Metrics.Groups, strings.TrimSpace(groupID))
+	cachedGroupType, multiplierLabel := resolveGroupInfo(upstreamSite.Metrics.Groups, strings.TrimSpace(groupID))
+	groupType := cachedGroupType
 	if requireAdminResourceType && state.Session.Platform == upstream.PlatformSub2API {
-		groupType, err = resolveAccountGroupType(groupType, requestedType, upstreamSite.Session.Platform == upstream.PlatformNewAPI)
-		if err != nil {
+		// 账号协议需要结合所选自有分组的平台才能最终确定，这里只提前拒绝非法显式选择。
+		if err := validateRequestedGroupType(requestedType); err != nil {
 			return connectionContext{}, err
 		}
+		groupType = ""
 	} else if groupType == "" {
 		groupType = strings.ToLower(strings.TrimSpace(requestedType))
 	}
@@ -128,6 +140,7 @@ func (s *Service) prepareConnectionContext(ctx context.Context, userID, siteID, 
 		upstreamSite:    upstreamSite,
 		upstreamSession: *upstreamSite.Session,
 		groupType:       groupType,
+		cachedGroupType: cachedGroupType,
 		groupName:       resolvedName,
 		multiplierLabel: multiplierLabel,
 	}, nil
@@ -163,38 +176,42 @@ func (s *Service) rejectDuplicateTarget(ctx context.Context, userID, adminAccoun
 	return nil
 }
 
-func (s *Service) resolveAdminGroups(ctx context.Context, state *State, requestedIDs []string) ([]string, []string, error) {
+func (s *Service) resolveAdminGroups(ctx context.Context, state *State, requestedIDs []string) (ownGroupSelection, error) {
 	if state == nil || len(requestedIDs) == 0 {
-		return nil, nil, requestError(ErrorRequest)
+		return ownGroupSelection{}, requestError(ErrorRequest)
 	}
 	groups, err := s.platformService.FetchAdminAllGroups(state.Session)
 	if err != nil {
-		return nil, nil, err
+		return ownGroupSelection{}, err
 	}
 	byID := make(map[string]upstream.AdminGroupInfo, len(groups))
 	for _, group := range groups {
 		byID[group.ID] = group
 	}
-	ids := make([]string, 0, len(requestedIDs))
-	names := make([]string, 0, len(requestedIDs))
+	selection := ownGroupSelection{
+		ids:       make([]string, 0, len(requestedIDs)),
+		names:     make([]string, 0, len(requestedIDs)),
+		platforms: make([]string, 0, len(requestedIDs)),
+	}
 	seen := make(map[string]struct{}, len(requestedIDs))
 	for _, requestedID := range requestedIDs {
 		requestedID = strings.TrimSpace(requestedID)
 		group, ok := byID[requestedID]
 		if !ok {
-			return nil, nil, requestError(ErrorRequest)
+			return ownGroupSelection{}, requestError(ErrorRequest)
 		}
 		if _, exists := seen[group.ID]; exists {
 			continue
 		}
 		seen[group.ID] = struct{}{}
-		ids = append(ids, group.ID)
-		names = append(names, group.Name)
+		selection.ids = append(selection.ids, group.ID)
+		selection.names = append(selection.names, group.Name)
+		selection.platforms = append(selection.platforms, normalizeProtocolValue(group.Platform))
 	}
-	if len(ids) == 0 {
-		return nil, nil, requestError(ErrorRequest)
+	if len(selection.ids) == 0 {
+		return ownGroupSelection{}, requestError(ErrorRequest)
 	}
-	return ids, names, nil
+	return selection, nil
 }
 
 func (s *Service) realConnectManaged(ctx context.Context, userID string, req RealConnectRequest) (RealConnectResponse, error) {
@@ -205,22 +222,40 @@ func (s *Service) realConnectManaged(ctx context.Context, userID string, req Rea
 	if err != nil {
 		return RealConnectResponse{}, err
 	}
+	adminIsNewAPI := connectionCtx.state.Session.Platform == upstream.PlatformNewAPI
+	if adminIsNewAPI && req.ChannelType <= 0 {
+		return RealConnectResponse{}, requestError(ErrorChannelTypeRequired)
+	}
 	operationID, requestHash, err := connectionOperationIdentity(userID, connectionCtx.adminAccountID, req)
 	if err != nil {
 		return RealConnectResponse{}, err
 	}
-	if err := s.rejectDuplicateTarget(ctx, userID, connectionCtx.adminAccountID, req.UpstreamSiteID, req.UpstreamGroupID, connectionCtx.groupName); err != nil {
-		return RealConnectResponse{}, err
-	}
-	ownGroupIDs, ownGroupNames, err := s.resolveAdminGroups(ctx, connectionCtx.state, req.OwnGroupIDs)
+	// 任何远端创建之前读取自有分组；Sub2API 账号协议必须与每个所选分组的平台一致。
+	ownGroups, err := s.resolveAdminGroups(ctx, connectionCtx.state, req.OwnGroupIDs)
 	if err != nil {
 		return RealConnectResponse{}, err
 	}
+	if !adminIsNewAPI {
+		connectionCtx.groupType, err = resolveManagedAccountGroupType(connectionCtx.cachedGroupType, req.GroupType, connectionCtx.upstreamSession.Platform == upstream.PlatformNewAPI, ownGroups.platforms)
+		if err != nil {
+			return RealConnectResponse{}, err
+		}
+	}
+	ownGroupIDs, ownGroupNames := ownGroups.ids, ownGroups.names
+
+	// 同一上游分组的创建与关联串行化，避免不同 operationId 的并发请求都通过重复检查。
+	release, locked := s.targetLocks.tryLock(connectionTargetLockKey(userID, connectionCtx.adminAccountID, req.UpstreamSiteID, req.UpstreamGroupID))
+	if !locked {
+		return RealConnectResponse{}, requestError(ErrorConnectionInProgress)
+	}
+	defer release()
+
 	operationStore, hasOperationStore := s.connRepository.(RealConnectionOperationRepository)
 	ownerToken, err := randomConnID()
 	if err != nil {
 		return RealConnectResponse{}, err
 	}
+	// 幂等结果优先于重复检查：客户端超时后用同一 operationId 重试应拿回已创建的连接而不是 409。
 	if hasOperationStore {
 		claim, claimErr := operationStore.ReserveRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, requestHash, ownerToken)
 		if claimErr != nil {
@@ -233,12 +268,22 @@ func (s *Service) realConnectManaged(ctx context.Context, userID string, req Rea
 			return RealConnectResponse{Connection: publicRealConnection(*claim.Connection)}, nil
 		}
 		if !claim.Owned {
+			if claim.Status == RealConnectionOperationReserved || claim.Status == RealConnectionOperationProvisioning {
+				return RealConnectResponse{}, requestError(ErrorConnectionInProgress)
+			}
 			return RealConnectResponse{}, requestError(ErrorRequest)
 		}
 	} else if existing, err := s.idempotentConnection(ctx, userID, connectionCtx.adminAccountID, operationID); err != nil {
 		return RealConnectResponse{}, err
 	} else if existing != nil {
 		return RealConnectResponse{Connection: publicRealConnection(*existing)}, nil
+	}
+	if err := s.rejectDuplicateTarget(ctx, userID, connectionCtx.adminAccountID, req.UpstreamSiteID, req.UpstreamGroupID, connectionCtx.groupName); err != nil {
+		if hasOperationStore {
+			// 未产生远端资源，记为可重试的失败；对方取消对接后同一 operationId 可重新占用。
+			_ = operationStore.FailRealConnectionOperation(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken, RealConnectionOperationFailed, err.Error(), "", "", "")
+		}
+		return RealConnectResponse{}, err
 	}
 	if hasOperationStore {
 		if err := operationStore.MarkRealConnectionOperationProvisioning(ctx, userID, connectionCtx.adminAccountID, operationID, ownerToken); err != nil {
@@ -400,9 +445,10 @@ func (s *Service) deleteUpstreamCredential(session upstream.Session, keyID strin
 
 func (s *Service) createAdminResource(connectionCtx connectionContext, requestedChannelType int, ownGroupIDs []string, key string) (string, string, error) {
 	if connectionCtx.state.Session.Platform == upstream.PlatformNewAPI {
+		// 渠道类型由调用方显式给出；缺失时不再静默回退为 OpenAI。
 		channelType := requestedChannelType
 		if channelType <= 0 {
-			channelType = groupTypeToNewAPIChannelType(connectionCtx.groupType)
+			return "", "", requestError(ErrorChannelTypeRequired)
 		}
 		name := fmt.Sprintf("%s-【%s】-%s", newAPIChannelTypeName(channelType), connectionCtx.upstreamSite.Name, connectionCtx.groupName)
 		id, err := s.platformService.CreateNewAPIChannel(connectionCtx.state.Session, name, connectionCtx.upstreamSite.BaseURL, key, channelType, ownGroupIDs)
@@ -578,11 +624,11 @@ func (s *Service) resolveExistingAdminResource(ctx context.Context, state *State
 		groupIDs = []string{group.ID}
 	}
 	returnResource := *selected
-	ids, names, err := s.resolveAdminGroups(ctx, state, groupIDs)
+	ownGroups, err := s.resolveAdminGroups(ctx, state, groupIDs)
 	if err != nil {
 		return upstream.AdminGroupAccountInfo{}, nil, nil, err
 	}
-	return returnResource, ids, names, nil
+	return returnResource, ownGroups.ids, ownGroups.names, nil
 }
 
 func (s *Service) resolveExistingCredential(site *upstream.Site, keys []upstream.Sub2APIKeyItem, keyID, groupID, groupName string, allowLegacy bool, legacyKey string) (string, error) {
@@ -626,6 +672,12 @@ func (s *Service) realBindExisting(ctx context.Context, userID string, req RealB
 	} else if existing != nil {
 		return RealConnectResponse{Connection: publicRealConnection(*existing)}, nil
 	}
+	// 与自动创建共用同一目标锁，重复检查到落库之间不允许同一上游分组的并发写入。
+	release, locked := s.targetLocks.tryLock(connectionTargetLockKey(userID, connectionCtx.adminAccountID, req.UpstreamSiteID, req.UpstreamGroupID))
+	if !locked {
+		return RealConnectResponse{}, requestError(ErrorConnectionInProgress)
+	}
+	defer release()
 	if err := s.rejectDuplicateTarget(ctx, userID, connectionCtx.adminAccountID, req.UpstreamSiteID, req.UpstreamGroupID, connectionCtx.groupName); err != nil {
 		return RealConnectResponse{}, err
 	}
@@ -652,7 +704,9 @@ func (s *Service) realBindExisting(ctx context.Context, userID string, req RealB
 			return RealConnectResponse{}, requestError(ErrorRequest)
 		}
 		mode = ProvisioningModeLegacy
-		ownGroupIDs, ownGroupNames, err = s.resolveAdminGroups(ctx, connectionCtx.state, req.OwnGroupIDs)
+		var ownGroups ownGroupSelection
+		ownGroups, err = s.resolveAdminGroups(ctx, connectionCtx.state, req.OwnGroupIDs)
+		ownGroupIDs, ownGroupNames = ownGroups.ids, ownGroups.names
 	} else {
 		resource, resolvedIDs, resolvedNames, resolveErr := s.resolveExistingAdminResource(ctx, connectionCtx.state, req.AdminGroupID, req.AdminResourceID)
 		if resolveErr != nil {
@@ -722,10 +776,11 @@ func (s *Service) realDisconnectConnection(ctx context.Context, userID string, r
 		if conn.UpstreamPlatform != "" && conn.UpstreamPlatform != string(upstreamSession.Platform) {
 			return requestError(ErrorRequest)
 		}
-		if err := s.deleteAdminResource(adminSession, conn.AdminAccountID); err != nil {
+		// 完整删除可能在两步之间失败；重试时已删除的一侧返回 404，按已完成处理以便继续清理。
+		if err := s.deleteAdminResource(adminSession, conn.AdminAccountID); err != nil && !isRemoteNotFound(err) {
 			return err
 		}
-		if err := s.deleteUpstreamCredential(upstreamSession, conn.UpstreamKeyID); err != nil {
+		if err := s.deleteUpstreamCredential(upstreamSession, conn.UpstreamKeyID); err != nil && !isRemoteNotFound(err) {
 			return err
 		}
 	}
@@ -741,6 +796,37 @@ func (s *Service) realDisconnectConnection(ctx context.Context, userID string, r
 		return s.removeUpstreamMappingAndDeleteConnection(ctx, userID, adminAccountID, req.ConnectionID, conn.UpstreamSiteID, conn.UpstreamGroupName)
 	}
 	return s.connRepository.DeleteRealConnection(ctx, req.ConnectionID, userID, adminAccountID)
+}
+
+// isRemoteNotFound 仅识别远端明确返回的 404/410；网络错误、权限错误和无法解析的响应都不视为已删除。
+func isRemoteNotFound(err error) bool {
+	var remoteErr *upstream.RequestError
+	if !errors.As(err, &remoteErr) {
+		return false
+	}
+	return remoteErr.StatusCode == http.StatusNotFound || remoteErr.StatusCode == http.StatusGone
+}
+
+// UpstreamGroupProtocol 返回创建账号时后端实际依据的上游分组平台缓存，供前端按真实平台筛选自有分组。
+func (s *Service) UpstreamGroupProtocol(ctx context.Context, userID, siteID, groupID string) (UpstreamGroupProtocolResponse, error) {
+	siteID, groupID = strings.TrimSpace(siteID), strings.TrimSpace(groupID)
+	if siteID == "" || groupID == "" {
+		return UpstreamGroupProtocolResponse{}, requestError(ErrorRequest)
+	}
+	adminAccountID, err := s.currentAdminAccountID(ctx, userID)
+	if err != nil {
+		return UpstreamGroupProtocolResponse{}, err
+	}
+	site, err := s.upstreamLookup.GetSite(ctx, siteID)
+	if err != nil || site == nil || site.UserID != userID || site.AdminAccountID != adminAccountID {
+		return UpstreamGroupProtocolResponse{}, requestError(ErrorRequest)
+	}
+	platform := site.Platform
+	if site.Session != nil && site.Session.Platform != "" {
+		platform = site.Session.Platform
+	}
+	groupType, _ := resolveGroupInfo(site.Metrics.Groups, groupID)
+	return UpstreamGroupProtocolResponse{UpstreamPlatform: string(platform), GroupType: groupType}, nil
 }
 
 func publicRealConnection(conn RealConnection) RealConnection {

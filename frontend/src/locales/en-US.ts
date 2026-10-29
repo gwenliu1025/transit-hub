@@ -424,7 +424,7 @@ export default {
         month: 'This Month'
       },
       delta: {
-        vsPrev: 'vs prev day',
+        vsPrev: 'vs yesterday (full day)',
         missingYesterday: 'Yesterday’s data unavailable',
         percentagePoints: '{value} pts'
       },
@@ -435,6 +435,7 @@ export default {
         title: 'Business Performance',
         subtitle: 'Revenue, cost, and net profit from Monday or the 1st of this month to date (Asia/Shanghai)',
         incomplete: 'Incomplete data',
+        missingDays: '{count} day(s) not recorded, excluded',
         periodRevenue: 'Period Revenue',
         periodCost: 'Period Cost',
         periodProfit: 'Period Net Profit',
@@ -448,7 +449,7 @@ export default {
         coverage: 'Balance Coverage',
         coverageHint: 'Upstream balance relative to total site user balance',
         runway: 'Estimated Runway',
-        runwayHint: 'Based on average daily cost for this period',
+        runwayHint: 'Based on average daily cost of the last 7 full days',
         runwayValue: '{value} days'
       },
       groups: {
@@ -1626,6 +1627,13 @@ export default {
         description: 'Let the system create both resources, or link resources that already exist.',
         ownGroupLabel: 'My Site Groups',
         ownGroupPlaceholder: 'Select my site groups',
+        ownGroupEmpty: 'No groups on my site are available for this connection.',
+        ownGroupNeedProtocol: 'Select the account protocol first, then choose my site groups.',
+        ownGroupEmptyForProtocol: 'My site has no {protocol} groups.',
+        ownGroupFirstHint: 'Choose my site groups first; the account protocol follows the group platform. Groups marked “Recommended” match the upstream model vendors.',
+        recommendedTag: 'Recommended',
+        protocolFromGroupHint: 'The account will be created with the {protocol} protocol.',
+        protocolOutsideInference: 'The upstream group lists {vendors} as model vendors, which does not include {protocol}. Confirm that the group supports this protocol.',
         upstreamGroupLabel: 'Connected Group',
         upstreamGroupPlaceholder: 'Select connected group',
         upstreamSiteLabel: 'Upstream Site',
@@ -1677,6 +1685,9 @@ export default {
           connectionExists: 'This upstream group already has a connection. Review it first.',
           groupTypeRequired: 'Select the account protocol. Model vendors do not define the connection protocol.',
           groupTypeInvalid: 'The selected protocol is not supported. Reload capabilities and select again.',
+          ownGroupPlatformMismatch: 'The selected groups do not match the account protocol, or mix different platforms. Reload and choose groups from one platform.',
+          channelTypeRequired: 'Select the channel type to create.',
+          connectionInProgress: 'This upstream group is already being connected. Refresh later to check the result and avoid duplicates.',
           network: 'A site request encountered a network error. If creation was submitted, check existing connections and remote resources before another attempt.',
           invalidUrl: 'The connection URL failed validation. Check its scheme, host and port.',
           remoteAuth: 'A connected site rejected authentication. Check the relevant site session and permissions.',
@@ -1847,7 +1858,10 @@ export default {
       errors: {
         invalidAutoPricingConfig: 'Invalid auto-pricing config: primary upstream not in linked upstreams, or min multiplier exceeds max.',
         connectionExists: 'A real connection already exists for this upstream group.',
-        managedDeleteOnly: 'Existing-resource links can only be unlinked locally; remote resources cannot be deleted.'
+        managedDeleteOnly: 'Existing-resource links can only be unlinked locally; remote resources cannot be deleted.',
+        ownGroupPlatformMismatch: 'The selected group platforms do not match the account protocol, or mix different platforms.',
+        channelTypeRequired: 'A channel type is required to create a New API channel.',
+        connectionInProgress: 'This upstream group is already being connected. Try again later.'
       }
     },
     tickets: {

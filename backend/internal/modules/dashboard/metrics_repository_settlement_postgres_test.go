@@ -86,7 +86,7 @@ func TestMetricsRepositorySettlementAtomicMerge(t *testing.T) {
 		return rows[0]
 	}
 	old := read()
-	if old.RevenueComplete || old.PurchaseComplete || !old.BalanceRecorded {
+	if old.RevenueComplete || old.PurchaseComplete || !old.BalanceRecorded || !old.PurchaseRecorded {
 		t.Fatalf("migration=%+v", old)
 	}
 	if err := r.Upsert(ctx, snap); err != nil {
@@ -161,7 +161,7 @@ func TestMetricsRepositorySettlementAtomicMerge(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("new history: rows=%v err=%v", rows, err)
 	}
-	if rows[0].BalanceRecorded || rows[0].SiteBalance != 0 || rows[0].PurchaseComplete {
+	if rows[0].BalanceRecorded || rows[0].SiteBalance != 0 || rows[0].PurchaseComplete || rows[0].PurchaseRecorded {
 		t.Fatalf("new history invented fields=%+v", rows[0])
 	}
 	repair.AdminAccountID = "c"
@@ -190,5 +190,107 @@ func TestMetricsRepositoryLiveTodayDoesNotFinalize(t *testing.T) {
 	snap.RevenueComplete = true
 	if err := r.Upsert(ctx, snap); !errors.Is(err, ErrSnapshotNotWritten) {
 		t.Fatalf("accepted today's settlement: %v", err)
+	}
+}
+
+// 成本合并：没有真实来源的写入不改成本；纯成本采样不碰营收；部分日结只抬高已有记录；完整日结覆盖并锁定。
+func TestMetricsRepositoryPurchaseMerge(t *testing.T) {
+	r, ctx := settlementPostgres(t)
+	today := time.Now().In(beijingLocation)
+	read := func(account string, offset int) DailySnapshot {
+		t.Helper()
+		rows, err := r.ListRange(ctx, "u", account, 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := today.AddDate(0, 0, offset).Format("2006-01-02")
+		for _, row := range rows {
+			if row.Date.Format("2006-01-02") == want {
+				return row
+			}
+		}
+		// 今日行不在 ListRange 范围内，直接查询。
+		var row DailySnapshot
+		if err := r.db.QueryRow(ctx, `SELECT today_profit,today_purchase,net_profit,revenue_complete,purchase_complete,purchase_recorded FROM dashboard_daily_stats WHERE user_id='u' AND admin_account_id=$1 AND date=$2`, account, want).
+			Scan(&row.TodayProfit, &row.TodayPurchase, &row.NetProfit, &row.RevenueComplete, &row.PurchaseComplete, &row.PurchaseRecorded); err != nil {
+			t.Fatal(err)
+		}
+		return row
+	}
+	write := func(s DailySnapshot) {
+		t.Helper()
+		if err := r.Upsert(ctx, s); err != nil {
+			t.Fatalf("upsert %+v: %v", s, err)
+		}
+	}
+
+	// 今日：仪表盘采样（营收 50、成本 20）→ 无数据采样不改成本 → 纯成本采样只改成本。
+	live := DailySnapshot{ID: "l1", UserID: "u", AdminAccountID: "b", Date: today, TodayProfit: 50, TodayPurchase: 20, PurchaseRecorded: true, BalanceRecorded: true, CreatedAt: time.Now()}
+	write(live)
+	live.ID, live.TodayProfit, live.TodayPurchase, live.PurchaseRecorded = "l2", 60, 0, false
+	write(live)
+	if got := read("b", 0); got.TodayProfit != 60 || got.TodayPurchase != 20 || got.NetProfit != 40 || !got.PurchaseRecorded {
+		t.Fatalf("unrecorded sample overwrote cost: %+v", got)
+	}
+	write(DailySnapshot{ID: "s1", UserID: "u", AdminAccountID: "b", Date: today, TodayPurchase: 35, PurchaseRecorded: true, PurchaseSampleOnly: true, CreatedAt: time.Now()})
+	if got := read("b", 0); got.TodayProfit != 60 || got.TodayPurchase != 35 || got.NetProfit != 25 {
+		t.Fatalf("cost-only sample touched revenue: %+v", got)
+	}
+
+	// 昨日（账户 b 无旧行）：仅营收日结建行时成本未知。
+	yesterday := today.AddDate(0, 0, -1)
+	write(DailySnapshot{ID: "y1", UserID: "u", AdminAccountID: "b", Date: yesterday, TodayProfit: 100, RevenueComplete: true, Settlement: true, CreatedAt: time.Now()})
+	if got := read("b", -1); got.PurchaseRecorded || got.TodayPurchase != 0 {
+		t.Fatalf("revenue-only settlement invented cost: %+v", got)
+	}
+	partial := DailySnapshot{ID: "y2", UserID: "u", AdminAccountID: "b", Date: yesterday, TodayPurchase: 30, PurchaseRecorded: true, Settlement: true, CreatedAt: time.Now()}
+	write(partial)
+	partial.TodayPurchase = 20
+	write(partial)
+	if got := read("b", -1); got.TodayPurchase != 30 || got.NetProfit != 70 || got.PurchaseComplete {
+		t.Fatalf("partial settlement lowered cost: %+v", got)
+	}
+	write(DailySnapshot{ID: "y3", UserID: "u", AdminAccountID: "b", Date: yesterday, TodayPurchase: 28, PurchaseComplete: true, Settlement: true, CreatedAt: time.Now()})
+	partial.TodayPurchase = 60
+	write(partial)
+	if got := read("b", -1); got.TodayPurchase != 28 || got.NetProfit != 72 || !got.PurchaseComplete || !got.RevenueComplete || got.TodayProfit != 100 {
+		t.Fatalf("complete settlement not authoritative: %+v", got)
+	}
+}
+
+// 首次建列时按既有证据回填 purchase_recorded：只由营收补数新建、从未采样成本的行保持未知。
+func TestMetricsRepositoryPurchaseRecordedBackfill(t *testing.T) {
+	r, ctx := settlementPostgres(t)
+	if _, err := r.db.Exec(ctx, `ALTER TABLE dashboard_daily_stats DROP COLUMN purchase_recorded;
+		INSERT INTO dashboard_daily_stats(id,user_id,admin_account_id,date,today_profit,today_purchase,revenue_complete,purchase_complete,balance_recorded)
+		VALUES ('revenue-only','u','b',(statement_timestamp() AT TIME ZONE 'Asia/Shanghai')::date-2,90,0,true,false,false),
+		       ('nonzero','u','b',(statement_timestamp() AT TIME ZONE 'Asia/Shanghai')::date-3,90,12,true,false,false),
+		       ('stale-sample','u','b',(statement_timestamp() AT TIME ZONE 'Asia/Shanghai')::date-4,90,0,false,false,true),
+		       ('settled-zero','u','b',(statement_timestamp() AT TIME ZONE 'Asia/Shanghai')::date-5,90,0,true,true,false)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.EnsureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.EnsureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	rows, err := r.db.Query(ctx, `SELECT id, purchase_recorded FROM dashboard_daily_stats`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var recorded bool
+		if err := rows.Scan(&id, &recorded); err != nil {
+			t.Fatal(err)
+		}
+		got[id] = recorded
+	}
+	// 上游未同步时的 0 成本采样（余额已记录）同样无法证明当日成本为 0；已结算的 0 是真实值。
+	if !got["old"] || got["revenue-only"] || !got["nonzero"] || got["stale-sample"] || !got["settled-zero"] {
+		t.Fatalf("backfill=%v", got)
 	}
 }

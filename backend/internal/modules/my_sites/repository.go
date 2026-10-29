@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"transithub/backend/internal/modules/upstream"
 )
 
 // StateMutation mutates the locked latest my_site_states row before it is saved in the same transaction.
@@ -185,6 +187,25 @@ func (r *Repository) Save(ctx context.Context, state State) error {
 			own_groups = EXCLUDED.own_groups,
 			updated_at = EXCLUDED.updated_at
 	`, state.UserID, state.AdminAccountID, state.BaseURL, state.Email, string(sessionJSON), string(mappingsJSON), string(ownGroupsJSON))
+	return err
+}
+
+// SaveSession 定向写入会话与身份列：行不存在时以空映射创建，已存在时不触碰 mappings/own_groups，
+// 避免令牌刷新或登录同步用请求开始时读到的旧映射覆盖并发保存的新映射。
+func (r *Repository) SaveSession(ctx context.Context, userID, adminAccountID, baseURL, email string, session upstream.Session) error {
+	sessionJSON, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.Exec(ctx, `
+		INSERT INTO my_site_states (user_id, admin_account_id, base_url, email, session, mappings, own_groups, updated_at)
+		VALUES ($1, $2, $3, $4, $5::jsonb, '[]'::jsonb, '[]'::jsonb, now())
+		ON CONFLICT (user_id, admin_account_id) DO UPDATE SET
+			base_url = EXCLUDED.base_url,
+			email = EXCLUDED.email,
+			session = EXCLUDED.session,
+			updated_at = EXCLUDED.updated_at
+	`, userID, adminAccountID, baseURL, email, string(sessionJSON))
 	return err
 }
 
@@ -548,6 +569,23 @@ func (r *Repository) ReserveRealConnectionOperation(ctx context.Context, userID,
 	}
 	if op.Status == RealConnectionOperationSucceeded {
 		conn, err := scanRealConnection(tx.QueryRow(ctx, realConnectionSelectSQL+` WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3`, userID, adminAccountID, operationID))
+		if err == pgx.ErrNoRows {
+			// 连接已被取消对接删除：同一意图（如未传 operationId 时由请求内容派生的标识）允许重新创建。
+			if _, err := tx.Exec(ctx, `
+				UPDATE real_connection_operations
+				SET owner_token = $4, status = $5, request_hash = $6, attempt_count = attempt_count + 1,
+					connection_id = '', remote_upstream_key_id = '', remote_admin_resource_id = '',
+					last_error = '', compensation_error = '', updated_at = now()
+				WHERE user_id = $1 AND workspace_admin_account_id = $2 AND operation_id = $3
+			`, userID, adminAccountID, operationID, ownerToken, RealConnectionOperationReserved, requestHash); err != nil {
+				return RealConnectionOperationClaim{}, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return RealConnectionOperationClaim{}, err
+			}
+			committed = true
+			return RealConnectionOperationClaim{Owned: true, Status: RealConnectionOperationReserved}, nil
+		}
 		if err != nil {
 			return RealConnectionOperationClaim{}, err
 		}

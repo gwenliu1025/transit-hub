@@ -107,8 +107,9 @@ type UpstreamSiteLookup interface {
 
 // BotNotifier 机器人通知发送接口，由 settings.Service 实现。
 // 自动调价成功后通过此接口向用户配置的机器人发送通知。
+// 必须按映射所属工作区发送：机器人 ID 只在该工作区的渠道配置中有效。
 type BotNotifier interface {
-	SendToBots(ctx context.Context, userID string, botIDs []string, message string)
+	SendToBotsForWorkspace(ctx context.Context, userID string, adminAccountID string, botIDs []string, message string)
 }
 
 // Service 负责分组映射的查询与保存，以及真实对接的编排。
@@ -120,6 +121,17 @@ type Service struct {
 	upstreamLookup  UpstreamSiteLookup
 	botNotifier     BotNotifier
 	accounts        AdminAccountResolver
+	// pricingLocks 按管理端站点串行化分组倍率的“读取 → 计算 → 写入”，
+	// 自动调价（每次站点同步各自一个协程）与活动调价共用，避免 New API GroupRatio 整表覆盖丢更新。
+	pricingLocks keyedMutex
+	// targetLocks 防止同一上游分组的并发创建/关联同时通过重复检查。
+	targetLocks keyedTryLock
+}
+
+// SessionStateRepository 只写会话与身份列，不覆盖 mappings/own_groups。
+// 刷新令牌、登录同步等“读取 → 网络请求 → 保存”流程使用它，避免把并发修改的映射写回旧值。
+type SessionStateRepository interface {
+	SaveSession(ctx context.Context, userID, adminAccountID, baseURL, email string, session upstream.Session) error
 }
 
 type AdminAccountResolver interface {
@@ -490,6 +502,9 @@ func (s *Service) RunAutoPricingNow(ctx context.Context, userID string, req Auto
 	if !ok || !mapping.EnableAutoPricing {
 		return AutoPricingRunResponse{}, requestError(ErrorRequest)
 	}
+	// 倍率读改写期间持有站点锁，避免与同步后自动调价、活动调价交错覆盖。
+	unlock := s.pricingLocks.lock(adminSiteLockKey(state.Session))
+	defer unlock()
 	adminGroups, err := s.platformService.FetchAdminAllGroups(state.Session)
 	if err != nil {
 		return AutoPricingRunResponse{}, err
@@ -514,22 +529,6 @@ func (s *Service) RunAutoPricingNow(ctx context.Context, userID string, req Auto
 // RealConnect 执行真实对接流程：按平台分支创建上游 Key/Token 和 admin 端转发目标（账号/Channel），最后持久化绑定记录。
 func (s *Service) RealConnect(ctx context.Context, userID string, req RealConnectRequest) (RealConnectResponse, error) {
 	return s.realConnectManaged(ctx, userID, req)
-}
-
-// groupTypeToNewAPIChannelType 将分组平台类型映射为 new-api channel type 数字（回退用）。
-func groupTypeToNewAPIChannelType(groupType string) int {
-	switch strings.ToLower(groupType) {
-	case "openai":
-		return 1
-	case "anthropic":
-		return 14
-	case "gemini":
-		return 24
-	case "deepseek":
-		return 43
-	default:
-		return 1
-	}
 }
 
 // newAPIChannelTypeName 返回 new-api channel type ID 对应的短名称，用于 channel 命名前缀。
@@ -967,9 +966,20 @@ func (s *Service) FetchAdminGroups(session upstream.Session) ([]upstream.AdminGr
 	return s.platformService.FetchAdminAllGroups(session)
 }
 
-// UpdateAdminGroupMultiplier 透传 platformService 修改 admin 自有分组倍率。
+// UpdateAdminGroupMultiplier 透传 platformService 修改 admin 自有分组倍率（活动调价使用）。
+// 与自动调价共用站点锁：New API 的 GroupRatio 为整表 GET+PUT，并发写会丢失其他分组的修改。
 func (s *Service) UpdateAdminGroupMultiplier(session upstream.Session, group upstream.AdminGroupInfo, multiplier float64) error {
+	unlock := s.pricingLocks.lock(adminSiteLockKey(session))
+	defer unlock()
 	return s.platformService.UpdateAdminGroupMultiplier(session, group, multiplier)
+}
+
+// saveSession 只持久化会话与身份列；旧版/测试仓储未实现定向写入时回退为整行保存。
+func (s *Service) saveSession(ctx context.Context, state *State) error {
+	if repo, ok := s.repository.(SessionStateRepository); ok {
+		return repo.SaveSession(ctx, state.UserID, state.AdminAccountID, state.BaseURL, state.Email, state.Session)
+	}
+	return s.repository.Save(ctx, *state)
 }
 
 // validatedState 刷新临期令牌并校验 admin 角色（平台中性）。
@@ -988,7 +998,8 @@ func (s *Service) validatedState(ctx context.Context, state *State) (*State, err
 	if refreshedSession.AccessToken != state.Session.AccessToken || refreshedSession.RefreshToken != state.Session.RefreshToken ||
 		refreshedSession.Cookie != state.Session.Cookie {
 		state.Session = refreshedSession
-		if err := s.repository.Save(ctx, *state); err != nil {
+		// 刷新请求期间映射可能已被并发修改，这里只写会话列。
+		if err := s.saveSession(ctx, state); err != nil {
 			return nil, err
 		}
 	}
@@ -1003,6 +1014,10 @@ func (s *Service) validatedState(ctx context.Context, state *State) (*State, err
 // 使 RealConnect 等依赖 my_site_states 的功能可以使用 admin 会话。
 // 保留已有的 mappings 和 own_groups，仅更新 session 和身份信息。
 func (s *Service) SyncAdminSession(ctx context.Context, userID string, adminAccountID string, session upstream.Session, identity string) error {
+	if repo, ok := s.repository.(SessionStateRepository); ok {
+		// 定向 upsert 会话与身份，不读取也不回写 mappings，避免覆盖并发的映射修改。
+		return repo.SaveSession(ctx, userID, adminAccountID, session.BaseURL, identity, session)
+	}
 	existing, err := s.repository.Get(ctx, userID, adminAccountID)
 	if err != nil {
 		return err
@@ -1472,7 +1487,7 @@ func (s *Service) ApplyAutoPricingAfterSync(ctx context.Context, userID, adminAc
 	if refreshedSession.AccessToken != state.Session.AccessToken || refreshedSession.RefreshToken != state.Session.RefreshToken ||
 		refreshedSession.Cookie != state.Session.Cookie {
 		state.Session = refreshedSession
-		_ = s.repository.Save(ctx, *state)
+		_ = s.saveSession(ctx, state)
 	}
 
 	// 3. 筛选启用自动调价的 mappings
@@ -1487,7 +1502,10 @@ func (s *Service) ApplyAutoPricingAfterSync(ctx context.Context, userID, adminAc
 		return
 	}
 
-	// 4. 获取 admin 端全量分组（用于匹配 OwnGroup → 分组 ID 和当前倍率）
+	// 4. 获取 admin 端全量分组（用于匹配 OwnGroup → 分组 ID 和当前倍率）。
+	// 多个站点同步协程会并发进入这里，从读取当前倍率到写入完成都持有站点锁。
+	unlock := s.pricingLocks.lock(adminSiteLockKey(state.Session))
+	defer unlock()
 	adminGroups, err := s.platformService.FetchAdminAllGroups(state.Session)
 	if err != nil {
 		log.Printf("[auto-pricing] 获取 admin 分组失败 user_id=%s err=%v", userID, err)
@@ -1646,7 +1664,7 @@ func (s *Service) processAutoPricing(ctx context.Context, userID string, adminAc
 	// 自动调价成功后发送通知（仅在开启通知且配置了机器人时）
 	if mapping.EnableAutoPricingNotify && len(mapping.AutoPricingNotifyBotIDs) > 0 && s.botNotifier != nil {
 		msg := formatAutoPricingNotify(mapping, siteName, result, oldOwnMultiplier)
-		s.botNotifier.SendToBots(ctx, userID, mapping.AutoPricingNotifyBotIDs, msg)
+		s.botNotifier.SendToBotsForWorkspace(ctx, userID, adminAccountID, mapping.AutoPricingNotifyBotIDs, msg)
 	}
 
 	return result
@@ -1700,7 +1718,7 @@ func (s *Service) processManualAutoPricing(ctx context.Context, userID string, a
 	}
 	if mapping.EnableAutoPricingNotify && len(mapping.AutoPricingNotifyBotIDs) > 0 && s.botNotifier != nil {
 		msg := formatAutoPricingNotify(mapping, "manual", result, oldOwnMultiplier)
-		s.botNotifier.SendToBots(ctx, userID, mapping.AutoPricingNotifyBotIDs, msg)
+		s.botNotifier.SendToBotsForWorkspace(ctx, userID, adminAccountID, mapping.AutoPricingNotifyBotIDs, msg)
 	}
 	return result, updated, nil
 }

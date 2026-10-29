@@ -61,6 +61,8 @@ type Service struct {
 	smtpSender smtpSender
 	// emailTemplateRepo 是邮件模板存储层窄接口，测试通过内存 fake 覆盖 workspace 隔离和限制规则。
 	emailTemplateRepo emailTemplateRepository
+	// channelReader 是机器人通知读取渠道配置的窄接口，由 *Repository 结构性满足；测试可注入内存 fake。
+	channelReader notificationChannelReader
 
 	// QQ Access Token 仅在进程内缓存，避免每条通知都向 QQ 开放平台换取凭证。
 	qqTokens     *qqTokenCache
@@ -72,17 +74,27 @@ type AdminAccountResolver interface {
 	RequireCurrentID(ctx context.Context, userID string) (string, error)
 }
 
+// notificationChannelReader 只暴露按显式工作区读取通知渠道的能力，供机器人通知发送使用。
+type notificationChannelReader interface {
+	GetNotificationChannels(ctx context.Context, userID string, adminAccountID string) (NotificationChannelSettings, error)
+}
+
 func NewService(client *http.Client, repository *Repository) *Service {
 	if client == nil {
 		client = egress.NewPublicHTTPSClient(30*time.Second, nil)
 	}
-	return &Service{
+	service := &Service{
 		client:            client,
 		repository:        repository,
 		smtpRepo:          repository,
 		emailTemplateRepo: repository,
 		qqTokens:          newQQTokenCache(),
 	}
+	// 避免把 nil *Repository 装进接口后误判为可用，导致通知发送时空指针。
+	if repository != nil {
+		service.channelReader = repository
+	}
+	return service
 }
 
 func (s *Service) SetAdminAccountResolver(accounts AdminAccountResolver) {
@@ -350,7 +362,8 @@ func (s *Service) TestNotification(ctx context.Context, dto TestNotificationRequ
 	}
 }
 
-// SendToBots 保留历史纯文本入口，活动通知、自动调价等现有调用方无需感知新增格式字段。
+// SendToBots 保留历史纯文本入口，按用户"当前选中"的工作区解析渠道，仅适用于请求态调用。
+// 后台任务（同步预警、自动调价、活动调价）必须使用 SendToBotsForWorkspace 传入自身工作区。
 func (s *Service) SendToBots(ctx context.Context, userID string, botIDs []string, message string) {
 	s.sendNotificationToBots(ctx, userID, botIDs, notificationMessage{
 		Content: message,
@@ -360,6 +373,7 @@ func (s *Service) SendToBots(ctx context.Context, userID string, botIDs []string
 
 // SendFormattedToBots 仅供显式选择了模板格式的通知使用。格式会按各平台的原生能力
 // 转换：HTML 在不支持原生 HTML 的渠道转成 Markdown，旧纯文本发送路径保持不变。
+// 与 SendToBots 相同，只按当前选中的工作区解析渠道。
 func (s *Service) SendFormattedToBots(ctx context.Context, userID string, botIDs []string, message string, format NotificationTemplateFormat) {
 	s.sendNotificationToBots(ctx, userID, botIDs, notificationMessage{
 		Content: message,
@@ -367,8 +381,24 @@ func (s *Service) SendFormattedToBots(ctx context.Context, userID string, botIDs
 	})
 }
 
-// sendNotificationToBots 从数据库加载用户的渠道配置，匹配 ID 后逐个发送。
-// 单个渠道失败只记录日志，不中断其他机器人发送（fire-and-forget）。
+// SendToBotsForWorkspace 按显式工作区发送纯文本通知。机器人 ID 只在所属工作区的渠道配置中
+// 有效，后台任务必须传入触发通知的工作区，不能依赖用户当前在界面上选中的工作区。
+func (s *Service) SendToBotsForWorkspace(ctx context.Context, userID string, adminAccountID string, botIDs []string, message string) {
+	s.sendNotificationToWorkspaceBots(ctx, userID, adminAccountID, botIDs, notificationMessage{
+		Content: message,
+		Format:  NotificationTemplateFormatText,
+	})
+}
+
+// SendFormattedToBotsForWorkspace 是 SendFormattedToBots 的显式工作区版本，供后台预警使用。
+func (s *Service) SendFormattedToBotsForWorkspace(ctx context.Context, userID string, adminAccountID string, botIDs []string, message string, format NotificationTemplateFormat) {
+	s.sendNotificationToWorkspaceBots(ctx, userID, adminAccountID, botIDs, notificationMessage{
+		Content: message,
+		Format:  normalizeNotificationTemplateFormat(format),
+	})
+}
+
+// sendNotificationToBots 先解析用户当前选中的工作区，再按该工作区发送。
 func (s *Service) sendNotificationToBots(ctx context.Context, userID string, botIDs []string, message notificationMessage) {
 	if len(botIDs) == 0 || message.Content == "" {
 		return
@@ -378,9 +408,22 @@ func (s *Service) sendNotificationToBots(ctx context.Context, userID string, bot
 		log.Printf("[settings] 当前 admin workspace 缺失 user_id=%s err=%v", userID, err)
 		return
 	}
-	channels, err := s.repository.GetNotificationChannels(ctx, userID, adminAccountID)
+	s.sendNotificationToWorkspaceBots(ctx, userID, adminAccountID, botIDs, message)
+}
+
+// sendNotificationToWorkspaceBots 从数据库加载指定工作区的渠道配置，匹配 ID 后逐个发送。
+// 单个渠道失败只记录日志，不中断其他机器人发送（fire-and-forget）。
+func (s *Service) sendNotificationToWorkspaceBots(ctx context.Context, userID string, adminAccountID string, botIDs []string, message notificationMessage) {
+	if len(botIDs) == 0 || message.Content == "" {
+		return
+	}
+	if s.channelReader == nil {
+		log.Printf("[settings] 通知渠道存储未配置 user_id=%s admin_account_id=%s", userID, adminAccountID)
+		return
+	}
+	channels, err := s.channelReader.GetNotificationChannels(ctx, userID, adminAccountID)
 	if err != nil {
-		log.Printf("[settings] 加载通知渠道配置失败 user_id=%s err=%v", userID, err)
+		log.Printf("[settings] 加载通知渠道配置失败 user_id=%s admin_account_id=%s err=%v", userID, adminAccountID, err)
 		return
 	}
 

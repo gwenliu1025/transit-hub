@@ -973,3 +973,101 @@ func TestProbeConnection_CannotProbeConnectionFromOtherWorkspace(t *testing.T) {
 		t.Fatalf("expected ErrorNotFound, got %v", err)
 	}
 }
+
+// redactingMySitesReader 模拟生产 my_sites：ListRealConnections 返回清空 Key 的展示数据，
+// 只有按显式工作区读取的 ListRealConnectionsForWorkspace 携带真实上游 Key。
+type redactingMySitesReader struct {
+	fakeMySitesReader
+}
+
+func (f redactingMySitesReader) ListRealConnections(ctx context.Context, userID string) ([]my_sites.RealConnection, error) {
+	out := make([]my_sites.RealConnection, 0, len(f.connections))
+	for _, c := range f.connections {
+		c.UpstreamKey = ""
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// newLegacyProbeService 搭建一条开启自动降级 + 远端动作的策略；dispatcher 被调用即 panic，
+// 用来证明错误凭据绝不会让旧手动探活误判鉴权失败并禁用上游渠道。
+func newLegacyProbeService(serverURL string, upstreamKey string) (*Service, *fakeRepository) {
+	repo := newFakeRepository()
+	repo.policies = []Policy{{
+		ID: "policy-1", UserID: "user1", AdminAccountID: "ws1", Name: "policy-one", Enabled: true, DailyProbeBudget: 1000,
+		FailureThreshold: 1, AutoDegradeEnabled: true, AutoRemoteActionEnabled: true,
+		ModelTargets: []ModelTarget{{ID: "target-a", PolicyID: "policy-1", ModelName: "model-a", ProviderFamily: ProviderOpenAI, Enabled: true, MaxProbeTokens: 1}},
+	}}
+	mySites := redactingMySitesReader{fakeMySitesReader{connections: []my_sites.RealConnection{
+		{ID: "conn-1", UserID: "user1", WorkspaceAdminAccountID: "ws1", UpstreamSiteID: "site-1", OwnGroupIDs: []string{"g1"}, UpstreamKey: upstreamKey},
+	}}}
+	svc := &Service{
+		repo: repo, mySites: mySites, sites: fakeSiteLookup{site: &upstream.Site{ID: "site-1", BaseURL: serverURL}},
+		accounts: fakeAdminAccountResolver{id: "ws1"}, dispatcher: panicIfCalledRemoteActionRunner{}, probeRunner: newTestRealProbeRunner(),
+	}
+	return svc, repo
+}
+
+// TestProbeConnection_UsesUnredactedWorkspaceCredential 回归：旧手动探活曾用脱敏列表里的空 Key 发请求，
+// 必然 401 后被判为鉴权失败而暂停链路、甚至远端禁用渠道；现在必须使用工作区内未脱敏的真实 Key。
+func TestProbeConnection_UsesUnredactedWorkspaceCredential(t *testing.T) {
+	var authHeaders []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "Bearer gateway-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+	svc, _ := newLegacyProbeService(server.URL, "gateway-key")
+
+	results, err := svc.ProbeConnection(context.Background(), "user1", "conn-1", ProbeConnectionInput{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authHeaders) != 1 || authHeaders[0] != "Bearer gateway-key" {
+		t.Fatalf("expected one probe with the real upstream key, got %v", authHeaders)
+	}
+	if len(results) != 1 || results[0].State != StateHealthy || results[0].LastErrorKey != "" {
+		t.Fatalf("expected healthy probe result, got %+v", results)
+	}
+	encoded, err := json.Marshal(results)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if strings.Contains(string(encoded), "gateway-key") {
+		t.Fatalf("upstream key leaked into probe response: %s", encoded)
+	}
+}
+
+// TestProbeConnection_EmptyKeySkipsInsteadOfAuthFailure 验证连接确实没有 Key 时只记 unsupported：
+// 不发真实请求、不消耗预算、不进入暂停状态，也不触发远端降级。
+func TestProbeConnection_EmptyKeySkipsInsteadOfAuthFailure(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	svc, repo := newLegacyProbeService(server.URL, "")
+
+	results, err := svc.ProbeConnection(context.Background(), "user1", "conn-1", ProbeConnectionInput{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("empty upstream key must not be sent to upstream, got %d requests", requests)
+	}
+	if len(results) != 1 || results[0].State != StateHealthy || results[0].LastErrorKey != upstream.ReasonCredentialUnavailable {
+		t.Fatalf("expected unchanged healthy state with credential_unavailable, got %+v", results)
+	}
+	if len(repo.budgetClaims) != 0 {
+		t.Fatalf("skipped probe must not consume daily budget, got %v", repo.budgetClaims)
+	}
+	if len(repo.events) != 1 || repo.events[0].Result != string(ResultUnsupported) || repo.events[0].ToState != string(StateHealthy) {
+		t.Fatalf("expected one unsupported event without state change, got %+v", repo.events)
+	}
+}

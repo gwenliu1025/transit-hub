@@ -21,7 +21,7 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 }
 
 // EnsureSchema 创建活动调价所需的两张表和索引。语句全部幂等（IF NOT EXISTS），
-// 不修改任何已有表，符合线上兼容要求。
+// 对已有表只追加带默认值/可空的列，符合线上兼容要求。
 func (r *Repository) EnsureSchema(ctx context.Context) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS group_rate_campaigns (
@@ -64,6 +64,9 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_group_rate_campaigns_workspace ON group_rate_campaigns (user_id, admin_account_id, status, start_at, end_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_group_rate_campaign_items_campaign ON group_rate_campaign_items (campaign_id)`,
+		// end_attempts / next_end_retry_at 记录恢复失败后的有界重试，避免调度器每轮无限重试并重复发结束通知。
+		`ALTER TABLE group_rate_campaigns ADD COLUMN IF NOT EXISTS end_attempts integer NOT NULL DEFAULT 0`,
+		`ALTER TABLE group_rate_campaigns ADD COLUMN IF NOT EXISTS next_end_retry_at timestamptz`,
 	}
 	for _, stmt := range statements {
 		if _, err := r.db.Exec(ctx, stmt); err != nil {
@@ -266,11 +269,42 @@ func (r *Repository) ListDueScheduled(ctx context.Context, now time.Time) ([]str
 	return r.listIDs(ctx, `SELECT id FROM group_rate_campaigns WHERE status = 'scheduled' AND start_at IS NOT NULL AND start_at <= $1`, now)
 }
 
-// ListDueRunning 返回所有到达结束时间、仍需恢复的活动，供调度器扫描。
-// 覆盖 running 和 partial 两种状态：partial 表示开启阶段部分分组失败，
-// 但仍有分组已经真实改价，到期时同样必须恢复。
+// listDueRunningSQL 覆盖 running 和 partial 两种状态：partial 表示开启阶段部分分组失败，
+// 但仍有分组已经真实改价，到期时同样必须恢复。恢复失败过的活动按 next_end_retry_at 退避，
+// end_attempts 达到上限后不再自动重试（用户仍可手动结束），避免每轮重试并重复发送结束通知。
+const listDueRunningSQL = `SELECT id FROM group_rate_campaigns
+	WHERE status IN ('running', 'partial') AND end_mode = 'scheduled' AND end_at IS NOT NULL AND end_at <= $1
+		AND end_attempts < $2 AND (next_end_retry_at IS NULL OR next_end_retry_at <= $1)`
+
+// listStuckEndingSQL 找出停留在 ending 超过阈值的活动：执行进程中断（崩溃/重启）后无人收尾。
+const listStuckEndingSQL = `SELECT id FROM group_rate_campaigns WHERE status = 'ending' AND updated_at <= $1`
+
+// claimForEndingSQL 抢占 running/partial 活动进入 ending，并累加恢复尝试次数。
+const claimForEndingSQL = `UPDATE group_rate_campaigns SET status = 'ending', end_attempts = end_attempts + 1, updated_at = now()
+	WHERE id = $1 AND status IN ('running', 'partial')
+	RETURNING end_attempts`
+
+// claimStuckEndingSQL 重新接管卡在 ending 的活动；刷新 updated_at 保证同一时刻只有一个接管者。
+const claimStuckEndingSQL = `UPDATE group_rate_campaigns SET end_attempts = end_attempts + 1, updated_at = now()
+	WHERE id = $1 AND status = 'ending' AND updated_at <= $2
+	RETURNING end_attempts`
+
+// finishStartSQL 只在活动仍处于开启抢占态 running 时落定结果，
+// 避免开启期间被手动结束（ending/ended/partial）后又被覆盖回 running。
+const finishStartSQL = `UPDATE group_rate_campaigns SET status = $2, updated_at = now() WHERE id = $1 AND status = 'running'`
+
+// finishEndSQL 只在活动仍处于 ending 时落定恢复结果，并记录下一次自动重试时间（NULL 表示不再重试）。
+const finishEndSQL = `UPDATE group_rate_campaigns SET status = $2, ended_at = now(), next_end_retry_at = $3, updated_at = now()
+	WHERE id = $1 AND status = 'ending'`
+
+// ListDueRunning 返回所有到达结束时间、仍需恢复且未超过重试上限的活动，供调度器扫描。
 func (r *Repository) ListDueRunning(ctx context.Context, now time.Time) ([]string, error) {
-	return r.listIDs(ctx, `SELECT id FROM group_rate_campaigns WHERE status IN ('running', 'partial') AND end_mode = 'scheduled' AND end_at IS NOT NULL AND end_at <= $1`, now)
+	return r.listIDs(ctx, listDueRunningSQL, now, maxEndAttempts)
+}
+
+// ListStuckEnding 返回在 staleBefore 之前进入 ending 且仍未落定的活动，供调度器兜底恢复。
+func (r *Repository) ListStuckEnding(ctx context.Context, staleBefore time.Time) ([]string, error) {
+	return r.listIDs(ctx, listStuckEndingSQL, staleBefore)
 }
 
 func (r *Repository) listIDs(ctx context.Context, sql string, args ...any) ([]string, error) {
@@ -304,28 +338,42 @@ func (r *Repository) ClaimForRunning(ctx context.Context, id string) (bool, erro
 	return tag.RowsAffected() == 1, nil
 }
 
-// ClaimForEnding 用条件更新把 running/partial 活动抢占为 ending，返回是否抢占成功。
+// ClaimForEnding 用条件更新把 running/partial 活动抢占为 ending，返回本次是第几次恢复尝试及是否抢占成功。
 // partial 活动可能仍有已成功改价、尚未恢复的分组，必须允许进入 ending 才能被恢复。
-func (r *Repository) ClaimForEnding(ctx context.Context, id string) (bool, error) {
-	tag, err := r.db.Exec(ctx, `
-		UPDATE group_rate_campaigns SET status = 'ending', updated_at = now()
-		WHERE id = $1 AND status IN ('running', 'partial')
-	`, id)
+func (r *Repository) ClaimForEnding(ctx context.Context, id string) (int, bool, error) {
+	return r.claimWithAttempt(ctx, claimForEndingSQL, id)
+}
+
+// ClaimStuckEnding 重新接管在 staleBefore 之前进入 ending 且仍未落定的活动，返回本次尝试序号。
+func (r *Repository) ClaimStuckEnding(ctx context.Context, id string, staleBefore time.Time) (int, bool, error) {
+	return r.claimWithAttempt(ctx, claimStuckEndingSQL, id, staleBefore)
+}
+
+func (r *Repository) claimWithAttempt(ctx context.Context, sql string, args ...any) (int, bool, error) {
+	var attempt int
+	if err := r.db.QueryRow(ctx, sql, args...).Scan(&attempt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return attempt, true, nil
+}
+
+// FinishStart 在开启执行完成后写入最终状态（running/partial/failed），返回是否写入。
+// 活动已不在 running（开启期间被结束）时不覆盖，返回 false。
+func (r *Repository) FinishStart(ctx context.Context, id string, status string) (bool, error) {
+	tag, err := r.db.Exec(ctx, finishStartSQL, id, status)
 	if err != nil {
 		return false, err
 	}
 	return tag.RowsAffected() == 1, nil
 }
 
-// FinishStart 在开启执行完成后写入最终状态（running/partial/failed）。
-func (r *Repository) FinishStart(ctx context.Context, id string, status string) error {
-	_, err := r.db.Exec(ctx, `UPDATE group_rate_campaigns SET status = $2, updated_at = now() WHERE id = $1`, id, status)
-	return err
-}
-
-// FinishEnd 在恢复执行完成后写入最终状态（ended/partial）并记录结束时间。
-func (r *Repository) FinishEnd(ctx context.Context, id string, status string) error {
-	_, err := r.db.Exec(ctx, `UPDATE group_rate_campaigns SET status = $2, ended_at = now(), updated_at = now() WHERE id = $1`, id, status)
+// FinishEnd 在恢复执行完成后写入最终状态（ended/partial）并记录结束时间；
+// nextRetryAt 非空表示调度器可在该时间后自动重试恢复。
+func (r *Repository) FinishEnd(ctx context.Context, id string, status string, nextRetryAt *time.Time) error {
+	_, err := r.db.Exec(ctx, finishEndSQL, id, status, nextRetryAt)
 	return err
 }
 

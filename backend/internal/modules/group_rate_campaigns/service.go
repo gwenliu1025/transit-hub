@@ -5,10 +5,44 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"transithub/backend/internal/modules/upstream"
 )
+
+const (
+	// campaignExecutionTimeout 是单次开启/恢复（远端改价 + 落库 + 通知）的总时限。执行与 HTTP 请求
+	// 生命周期解绑，客户端断开不会中断已开始的改价/恢复，避免分组停留在 pending 或活动卡在 ending。
+	campaignExecutionTimeout = 10 * time.Minute
+	// stuckEndingAfter 明显长于单次执行时限：超过它仍停在 ending，说明执行进程已中断，由调度器重新接管。
+	stuckEndingAfter = 30 * time.Minute
+	// maxEndAttempts 是调度器自动恢复的尝试上限（含首次），用尽后不再自动重试，只能手动结束。
+	maxEndAttempts = 5
+	// 恢复失败后的退避：首次 endRetryBaseDelay，之后按次数翻倍，最长 endRetryMaxDelay。
+	endRetryBaseDelay = time.Minute
+	endRetryMaxDelay  = 30 * time.Minute
+)
+
+// reasonOriginalMultiplierUnavailable 表示远端未返回原倍率：无法保证结束时恢复，因此不改价也不"恢复"成 0。
+const reasonOriginalMultiplierUnavailable = "original multiplier unavailable"
+
+// endTrigger 区分恢复由谁触发：手动结束的每次结果都通知；调度器的失败只在重试用尽时通知一次。
+type endTrigger int
+
+const (
+	endTriggerScheduler endTrigger = iota
+	endTriggerManual
+)
+
+// notifyLocation 是活动通知中时间的展示时区；容器缺少 tzdata 时回退到固定 UTC+8。
+var notifyLocation = func() *time.Location {
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.FixedZone("CST", 8*60*60)
+	}
+	return location
+}()
 
 // AdminGroupOperator 是活动调价对 admin 自有分组的全部远端依赖，由 my_sites.Service 实现。
 // 定义为窄接口而不是直接依赖 my_sites 包，避免跨模块的实现耦合。
@@ -19,8 +53,9 @@ type AdminGroupOperator interface {
 }
 
 // BotNotifier 机器人通知发送接口，由 settings.Service 实现。
+// 必须按活动所属工作区发送：机器人 ID 只在该工作区的渠道配置中有效。
 type BotNotifier interface {
-	SendToBots(ctx context.Context, userID string, botIDs []string, message string)
+	SendToBotsForWorkspace(ctx context.Context, userID string, adminAccountID string, botIDs []string, message string)
 }
 
 // GroupTypeLookup 按分组倍率页面已有的 type/search/platform 条件查询匹配的分组名，
@@ -48,10 +83,12 @@ type campaignRepository interface {
 	List(ctx context.Context, userID string, adminAccountID string, query ListQuery) ([]Campaign, int, error)
 	ListDueScheduled(ctx context.Context, now time.Time) ([]string, error)
 	ListDueRunning(ctx context.Context, now time.Time) ([]string, error)
+	ListStuckEnding(ctx context.Context, staleBefore time.Time) ([]string, error)
 	ClaimForRunning(ctx context.Context, id string) (bool, error)
-	ClaimForEnding(ctx context.Context, id string) (bool, error)
-	FinishStart(ctx context.Context, id string, status string) error
-	FinishEnd(ctx context.Context, id string, status string) error
+	ClaimForEnding(ctx context.Context, id string) (int, bool, error)
+	ClaimStuckEnding(ctx context.Context, id string, staleBefore time.Time) (int, bool, error)
+	FinishStart(ctx context.Context, id string, status string) (bool, error)
+	FinishEnd(ctx context.Context, id string, status string, nextRetryAt *time.Time) error
 	ClaimForCancel(ctx context.Context, id string) (bool, error)
 }
 
@@ -71,6 +108,9 @@ type Service struct {
 	typeLookup GroupTypeLookup
 	accounts   AdminAccountResolver
 	config     Config
+
+	// campaignLocks 按活动 ID 串行化本进程内的开启/恢复执行，值为 *sync.Mutex。
+	campaignLocks sync.Map
 }
 
 func NewService(repository *Repository, operator AdminGroupOperator, notifier BotNotifier, typeLookup GroupTypeLookup, config Config) *Service {
@@ -257,7 +297,7 @@ func (s *Service) End(ctx context.Context, userID string, adminAccountID string,
 	if campaign.Status != StatusRunning && campaign.Status != StatusPartial {
 		return CampaignDetail{}, ErrInvalidState
 	}
-	s.endCampaign(ctx, id)
+	s.endCampaign(ctx, id, endTriggerManual)
 	return s.Get(ctx, userID, adminAccountID, id)
 }
 
@@ -280,8 +320,8 @@ func (s *Service) Cancel(ctx context.Context, userID string, adminAccountID stri
 	return s.Get(ctx, userID, adminAccountID, id)
 }
 
-// StartScheduler 启动后台调度协程：定期扫描到期的 scheduled/running 活动并执行开启/恢复。
-// 启动时立即跑一轮，覆盖"进程重启后自动处理到期 running 活动"的要求。
+// StartScheduler 启动后台调度协程：定期扫描到期的 scheduled/running 活动并执行开启/恢复，
+// 并接管卡在 ending 的活动。启动时立即跑一轮，覆盖"进程重启后自动处理到期 running 活动"的要求。
 func (s *Service) StartScheduler(ctx context.Context) {
 	interval := s.config.SchedulerInterval
 	if interval <= 0 {
@@ -317,14 +357,43 @@ func (s *Service) runSchedulerTick(ctx context.Context) {
 		log.Printf("[group-rate-campaigns] scan due running failed: %v", err)
 	} else {
 		for _, id := range dueRunning {
-			s.endCampaign(ctx, id)
+			s.endCampaign(ctx, id, endTriggerScheduler)
 		}
 	}
+	staleBefore := now.Add(-stuckEndingAfter)
+	stuckEnding, err := s.repository.ListStuckEnding(ctx, staleBefore)
+	if err != nil {
+		log.Printf("[group-rate-campaigns] scan stuck ending failed: %v", err)
+	} else {
+		for _, id := range stuckEnding {
+			s.recoverStuckEnding(ctx, id, staleBefore)
+		}
+	}
+}
+
+// detachedExecutionContext 让开启/恢复脱离调用方（HTTP 请求/调度器）的取消信号，只受总时限约束，
+// 保证远端改价和对应落库成对完成，同时保留调用方 ctx 中的值。
+func detachedExecutionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), campaignExecutionTimeout)
+}
+
+// lockCampaign 串行化同一活动在本进程内的开启/恢复：开启尚未落定时到来的结束会等待开启完成，
+// 保证恢复阶段能看到全部已改价分组；跨进程并发仍由条件更新兜底。
+func (s *Service) lockCampaign(id string) func() {
+	value, _ := s.campaignLocks.LoadOrStore(id, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // startCampaign 执行一个活动的开启动作：抢占状态 -> 拉取会话与自有分组 -> 解析目标 -> 逐个改倍率。
 // 单个分组失败不中断其余分组；调度器和手动"立即开始"共用此逻辑，条件更新保证幂等。
 func (s *Service) startCampaign(ctx context.Context, id string) {
+	unlock := s.lockCampaign(id)
+	defer unlock()
+	ctx, cancel := detachedExecutionContext(ctx)
+	defer cancel()
+
 	claimed, err := s.repository.ClaimForRunning(ctx, id)
 	if err != nil {
 		log.Printf("[group-rate-campaigns] claim for running failed id=%s err=%v", id, err)
@@ -337,26 +406,26 @@ func (s *Service) startCampaign(ctx context.Context, id string) {
 	campaign, err := s.repository.GetByID(ctx, id)
 	if err != nil || campaign == nil {
 		log.Printf("[group-rate-campaigns] load campaign failed id=%s err=%v", id, err)
-		_ = s.repository.FinishStart(ctx, id, StatusFailed)
+		_, _ = s.repository.FinishStart(ctx, id, StatusFailed)
 		return
 	}
 
 	session, err := s.operator.RequireSession(ctx, campaign.UserID, campaign.AdminAccountID)
 	if err != nil {
 		log.Printf("[group-rate-campaigns] require session failed id=%s err=%v", id, err)
-		_ = s.repository.FinishStart(ctx, id, StatusFailed)
+		_, _ = s.repository.FinishStart(ctx, id, StatusFailed)
 		return
 	}
 	groups, err := s.operator.FetchAdminGroups(session)
 	if err != nil {
 		log.Printf("[group-rate-campaigns] fetch admin groups failed id=%s err=%v", id, err)
-		_ = s.repository.FinishStart(ctx, id, StatusFailed)
+		_, _ = s.repository.FinishStart(ctx, id, StatusFailed)
 		return
 	}
 	targets, err := s.resolveManualSelectionWithRates(campaign.Selection, groups)
 	if err != nil {
 		log.Printf("[group-rate-campaigns] resolve selection failed id=%s err=%v", id, err)
-		_ = s.repository.FinishStart(ctx, id, StatusFailed)
+		_, _ = s.repository.FinishStart(ctx, id, StatusFailed)
 		return
 	}
 
@@ -382,14 +451,20 @@ func (s *Service) startCampaign(ctx context.Context, id string) {
 
 	if err := s.repository.SaveItems(ctx, pendings); err != nil {
 		log.Printf("[group-rate-campaigns] save items failed id=%s err=%v", id, err)
-		_ = s.repository.FinishStart(ctx, id, StatusFailed)
+		_, _ = s.repository.FinishStart(ctx, id, StatusFailed)
 		return
 	}
 
 	applied, failed := 0, 0
 	appliedAt := time.Now()
 	for _, item := range pendings {
-		originalValue := floatOrZero(item.OriginalMultiplier)
+		if item.OriginalMultiplier == nil {
+			// 远端未返回原倍率（如 New API 分组缺倍率）时无法保证结束恢复，跳过改价并标记失败。
+			_ = s.repository.UpdateItemApply(ctx, item.ID, nil, ItemFailed, reasonOriginalMultiplierUnavailable, nil)
+			failed++
+			continue
+		}
+		originalValue := *item.OriginalMultiplier
 		if !multiplierChanged(originalValue, item.CampaignMultiplier) {
 			_ = s.repository.UpdateItemApply(ctx, item.ID, item.OriginalMultiplier, ItemApplied, "", &appliedAt)
 			applied++
@@ -416,17 +491,24 @@ func (s *Service) startCampaign(ctx context.Context, id string) {
 	} else if failed > 0 {
 		status = StatusPartial
 	}
-	if err := s.repository.FinishStart(ctx, id, status); err != nil {
+	if finished, err := s.repository.FinishStart(ctx, id, status); err != nil {
 		log.Printf("[group-rate-campaigns] finish start failed id=%s err=%v", id, err)
+	} else if !finished {
+		// 开启期间活动已被结束流程抢占：保留其状态，不能覆盖回 running/partial/failed。
+		log.Printf("[group-rate-campaigns] campaign left running during start, keep current status id=%s computed=%s", id, status)
 	}
 
 	s.notifyStart(ctx, campaign, applied, failed, len(pendings))
 }
 
-// endCampaign 执行一个活动的恢复动作：抢占状态 -> 拉取会话与自有分组 -> 按 original_multiplier 逐个恢复。
-// 通知失败或会话获取失败都不回滚已恢复的分组，也不阻塞活动状态流转到 partial/ended。
-func (s *Service) endCampaign(ctx context.Context, id string) {
-	claimed, err := s.repository.ClaimForEnding(ctx, id)
+// endCampaign 抢占 running/partial 活动进入 ending 后执行恢复。手动结束和调度器到期共用此入口。
+func (s *Service) endCampaign(ctx context.Context, id string, trigger endTrigger) {
+	unlock := s.lockCampaign(id)
+	defer unlock()
+	ctx, cancel := detachedExecutionContext(ctx)
+	defer cancel()
+
+	attempt, claimed, err := s.repository.ClaimForEnding(ctx, id)
 	if err != nil {
 		log.Printf("[group-rate-campaigns] claim for ending failed id=%s err=%v", id, err)
 		return
@@ -434,17 +516,42 @@ func (s *Service) endCampaign(ctx context.Context, id string) {
 	if !claimed {
 		return
 	}
+	s.restoreCampaign(ctx, id, attempt, trigger)
+}
 
+// recoverStuckEnding 重新接管卡在 ending 的活动（执行进程中断后无人收尾）并重跑恢复；
+// 已恢复/无需恢复的分组会被跳过，恢复写入的是原倍率，重复执行是幂等的。
+func (s *Service) recoverStuckEnding(ctx context.Context, id string, staleBefore time.Time) {
+	unlock := s.lockCampaign(id)
+	defer unlock()
+	ctx, cancel := detachedExecutionContext(ctx)
+	defer cancel()
+
+	attempt, claimed, err := s.repository.ClaimStuckEnding(ctx, id, staleBefore)
+	if err != nil {
+		log.Printf("[group-rate-campaigns] claim stuck ending failed id=%s err=%v", id, err)
+		return
+	}
+	if !claimed {
+		return
+	}
+	log.Printf("[group-rate-campaigns] recover stuck ending campaign id=%s attempt=%d", id, attempt)
+	s.restoreCampaign(ctx, id, attempt, endTriggerScheduler)
+}
+
+// restoreCampaign 执行一个已处于 ending 的活动的恢复动作：拉取会话与自有分组 -> 按 original_multiplier 逐个恢复。
+// 通知失败或会话获取失败都不回滚已恢复的分组，也不阻塞活动状态流转到 partial/ended。
+func (s *Service) restoreCampaign(ctx context.Context, id string, attempt int, trigger endTrigger) {
 	campaign, err := s.repository.GetByID(ctx, id)
 	if err != nil || campaign == nil {
 		log.Printf("[group-rate-campaigns] load campaign failed id=%s err=%v", id, err)
-		_ = s.repository.FinishEnd(ctx, id, StatusPartial)
+		s.finishEndWithoutNotify(ctx, id, attempt)
 		return
 	}
 	items, err := s.repository.ListItems(ctx, id)
 	if err != nil {
 		log.Printf("[group-rate-campaigns] list items failed id=%s err=%v", id, err)
-		_ = s.repository.FinishEnd(ctx, id, StatusPartial)
+		s.finishEndWithoutNotify(ctx, id, attempt)
 		return
 	}
 
@@ -452,16 +559,14 @@ func (s *Service) endCampaign(ctx context.Context, id string) {
 	if err != nil {
 		log.Printf("[group-rate-campaigns] require session failed id=%s err=%v", id, err)
 		failed := s.markAllRestoreFailed(ctx, items, err.Error())
-		_ = s.repository.FinishEnd(ctx, id, endStatus(failed))
-		s.notifyEnd(ctx, campaign, 0, failed)
+		s.finishEnd(ctx, campaign, attempt, trigger, 0, failed)
 		return
 	}
 	groups, err := s.operator.FetchAdminGroups(session)
 	if err != nil {
 		log.Printf("[group-rate-campaigns] fetch admin groups failed id=%s err=%v", id, err)
 		failed := s.markAllRestoreFailed(ctx, items, err.Error())
-		_ = s.repository.FinishEnd(ctx, id, endStatus(failed))
-		s.notifyEnd(ctx, campaign, 0, failed)
+		s.finishEnd(ctx, campaign, attempt, trigger, 0, failed)
 		return
 	}
 
@@ -474,15 +579,21 @@ func (s *Service) endCampaign(ctx context.Context, id string) {
 		if item.RestoreStatus == ItemRestored || item.RestoreStatus == ItemUnchanged {
 			continue
 		}
-		originalValue := floatOrZero(item.OriginalMultiplier)
+		if item.OriginalMultiplier == nil {
+			// 原倍率未知时绝不"恢复"成 0，保留失败记录等待人工处理。
+			_ = s.repository.UpdateItemRestore(ctx, item.ID, nil, ItemFailed, reasonOriginalMultiplierUnavailable, nil)
+			failed++
+			continue
+		}
+		originalValue := *item.OriginalMultiplier
 		groupInfo := findGroup(groups, item.GroupName)
 		if groupInfo == nil {
 			_ = s.repository.UpdateItemRestore(ctx, item.ID, nil, ItemFailed, "group not found", nil)
 			failed++
 			continue
 		}
-		currentValue := floatOrZero(groupInfo.Multiplier)
-		if !multiplierChanged(currentValue, originalValue) {
+		// 当前倍率未知时无法确认已是原倍率，必须真实恢复，不能判定为 unchanged。
+		if groupInfo.Multiplier != nil && !multiplierChanged(*groupInfo.Multiplier, originalValue) {
 			value := originalValue
 			_ = s.repository.UpdateItemRestore(ctx, item.ID, &value, ItemUnchanged, "", &restoredAt)
 			restored++
@@ -498,10 +609,49 @@ func (s *Service) endCampaign(ctx context.Context, id string) {
 		restored++
 	}
 
-	if err := s.repository.FinishEnd(ctx, id, endStatus(failed)); err != nil {
+	s.finishEnd(ctx, campaign, attempt, trigger, restored, failed)
+}
+
+// finishEnd 落定一次恢复结果并决定是否发送结束通知：全部恢复为 ended 并通知；有失败为 partial，
+// 未达重试上限时记录下次自动重试时间。手动结束的每次结果都通知，调度器只在成功或重试用尽时通知，
+// 保证同一结果只通知一次，不会每轮调度重复发送。
+func (s *Service) finishEnd(ctx context.Context, campaign *Campaign, attempt int, trigger endTrigger, restored int, failed int) {
+	status := endStatus(failed)
+	var nextRetryAt *time.Time
+	notify := true
+	if failed > 0 {
+		nextRetryAt = nextEndRetryAt(attempt, time.Now())
+		notify = trigger == endTriggerManual || nextRetryAt == nil
+	}
+	if err := s.repository.FinishEnd(ctx, campaign.ID, status, nextRetryAt); err != nil {
+		log.Printf("[group-rate-campaigns] finish end failed id=%s err=%v", campaign.ID, err)
+	}
+	if notify {
+		s.notifyEnd(ctx, campaign, restored, failed)
+	}
+}
+
+// finishEndWithoutNotify 用于读取活动/明细失败的兜底路径：结果未知，不发送通知，只安排有界重试。
+func (s *Service) finishEndWithoutNotify(ctx context.Context, id string, attempt int) {
+	if err := s.repository.FinishEnd(ctx, id, StatusPartial, nextEndRetryAt(attempt, time.Now())); err != nil {
 		log.Printf("[group-rate-campaigns] finish end failed id=%s err=%v", id, err)
 	}
-	s.notifyEnd(ctx, campaign, restored, failed)
+}
+
+// nextEndRetryAt 返回第 attempt 次恢复失败后的下次自动重试时间；达到上限返回 nil 表示不再自动重试。
+func nextEndRetryAt(attempt int, now time.Time) *time.Time {
+	if attempt >= maxEndAttempts {
+		return nil
+	}
+	delay := endRetryBaseDelay
+	for i := 1; i < attempt && delay < endRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > endRetryMaxDelay {
+		delay = endRetryMaxDelay
+	}
+	retryAt := now.Add(delay)
+	return &retryAt
 }
 
 func endStatus(failed int) string {
@@ -656,7 +806,7 @@ func (s *Service) notifyStart(ctx context.Context, campaign *Campaign, applied i
 		"executedAt":   formatTime(timePtr(time.Now())),
 	}
 	message := renderTemplate(tpl, vars)
-	s.notifier.SendToBots(ctx, campaign.UserID, campaign.Notify.BotIDs, message)
+	s.notifier.SendToBotsForWorkspace(ctx, campaign.UserID, campaign.AdminAccountID, campaign.Notify.BotIDs, message)
 }
 
 // notifyEnd 发送活动结束通知：恢复成功、部分失败均发送，失败只记录日志不阻塞流程。
@@ -682,7 +832,7 @@ func (s *Service) notifyEnd(ctx context.Context, campaign *Campaign, restored in
 		"executedAt":         formatTime(timePtr(time.Now())),
 	}
 	message := renderTemplate(tpl, vars)
-	s.notifier.SendToBots(ctx, campaign.UserID, campaign.Notify.BotIDs, message)
+	s.notifier.SendToBotsForWorkspace(ctx, campaign.UserID, campaign.AdminAccountID, campaign.Notify.BotIDs, message)
 }
 
 // normalizeNotify 用环境变量默认值补全未启用/未填写的通知字段，只在字段为空时兜底，不覆盖显式选择。
@@ -790,11 +940,12 @@ func timePtr(t time.Time) *time.Time {
 	return &t
 }
 
+// formatTime 统一按北京时间展示通知时间，不受容器进程时区（通常为 UTC）影响。
 func formatTime(t *time.Time) string {
 	if t == nil {
 		return ""
 	}
-	return t.Format("2006-01-02 15:04:05")
+	return t.In(notifyLocation).Format("2006-01-02 15:04:05")
 }
 
 func findGroup(groups []upstream.AdminGroupInfo, name string) *upstream.AdminGroupInfo {

@@ -10,6 +10,7 @@ import type {
   RealConnection,
   RealDisconnectRequest,
   UpstreamKeyItem,
+  UpstreamGroupProtocolResponse,
   AdminResourceOption,
 } from '../types/mySites'
 import {
@@ -135,6 +136,16 @@ export const listUpstreamKeys = async (siteId: string, groupId: string, groupNam
         keyPreview: item.keyPreview || (item.key ? `${item.key.slice(0, 6)}...${item.key.slice(-4)}` : ''),
       }))
     : []
+}
+
+// 读取上游分组在站点缓存中的真实平台；旧后端没有该接口时由调用方回退到快照类型。
+export const getUpstreamGroupProtocol = async (siteId: string, groupId: string): Promise<UpstreamGroupProtocolResponse> => {
+  const params = new URLSearchParams({ siteId, groupId })
+  const result = await requestJson<Partial<UpstreamGroupProtocolResponse>>(`/my-sites/upstream-group-protocol?${params.toString()}`)
+  return {
+    upstreamPlatform: typeof result.upstreamPlatform === 'string' ? result.upstreamPlatform : '',
+    groupType: typeof result.groupType === 'string' ? result.groupType : '',
+  }
 }
 
 export const listAdminResources = async (groupId: string): Promise<AdminResourceOption[]> => {

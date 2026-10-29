@@ -25,6 +25,7 @@ func RegisterRoutes(mux *http.ServeMux, service *Service) {
 	mux.HandleFunc("POST /api/my-sites/real-connect", handler.realConnect)
 	mux.HandleFunc("POST /api/my-sites/real-bind", handler.realBind)
 	mux.HandleFunc("GET /api/my-sites/upstream-keys", handler.listUpstreamKeys)
+	mux.HandleFunc("GET /api/my-sites/upstream-group-protocol", handler.upstreamGroupProtocol)
 	mux.HandleFunc("GET /api/my-sites/admin-resources", handler.listAdminResources)
 	mux.HandleFunc("GET /api/my-sites/real-connections", handler.listRealConnections)
 	mux.HandleFunc("POST /api/my-sites/real-disconnect", handler.realDisconnect)
@@ -169,6 +170,22 @@ func (h *Handler) listUpstreamKeys(w http.ResponseWriter, r *http.Request) {
 	httpjson.Write(w, http.StatusOK, keys)
 }
 
+// upstreamGroupProtocol 返回上游分组在站点缓存中的真实平台，前端据此筛选自有分组，
+// 不依赖分组倍率快照里可被手动编辑的类型。
+func (h *Handler) upstreamGroupProtocol(w http.ResponseWriter, r *http.Request) {
+	userID, ok := authctx.UserID(r.Context())
+	if !ok {
+		httpjson.WriteError(w, http.StatusUnauthorized, "auth.errors.unauthorized")
+		return
+	}
+	response, err := h.service.UpstreamGroupProtocol(r.Context(), userID, r.URL.Query().Get("siteId"), r.URL.Query().Get("groupId"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusOK, response)
+}
+
 // listAdminResources returns existing accounts/channels from one group on the
 // current admin site. The service repeats this lookup during binding so stale or
 // forged browser selections cannot create a local connection record.
@@ -264,7 +281,7 @@ func writeError(w http.ResponseWriter, err error) {
 		if requestErr == requestError("admin.adminAccounts.errors.noCurrentAccount") {
 			status = http.StatusConflict
 		}
-		if requestErr == requestError(ErrorConnectionExists) || requestErr == requestError(ErrorManagedDeleteOnly) {
+		if requestErr == requestError(ErrorConnectionExists) || requestErr == requestError(ErrorManagedDeleteOnly) || requestErr == requestError(ErrorConnectionInProgress) {
 			status = http.StatusConflict
 		}
 		httpjson.WriteError(w, status, requestErr.Error())

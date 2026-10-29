@@ -63,6 +63,14 @@ func (r *MetricsRepository) EnsureSchema(ctx context.Context) error {
 		-- 旧行已有采样余额；新建补数行没有历史余额。重复启动不改已有标记。
 		ALTER TABLE dashboard_daily_stats ADD COLUMN IF NOT EXISTS balance_recorded boolean NOT NULL DEFAULT true;
 		ALTER TABLE dashboard_daily_stats ALTER COLUMN balance_recorded SET DEFAULT false;
+		-- 成本是否有真实来源。首次建列时按既有证据回填：已结算或成本非零才算有记录；
+		-- 未结算且成本为 0 的行（营收补数新建，或上游尚未同步时的采样）无法区分真实 0 与缺数据，
+		-- 一律视为未记录：前端显示缺口而不是 ¥0，最近 7 天内的由日结自动补跑。
+		DO $$ BEGIN
+			ALTER TABLE dashboard_daily_stats ADD COLUMN purchase_recorded boolean NOT NULL DEFAULT false;
+			UPDATE dashboard_daily_stats SET purchase_recorded = purchase_complete OR today_purchase <> 0;
+		EXCEPTION WHEN duplicate_column THEN NULL;
+		END $$;
 
 		-- 删除旧的 (user_id, date) 唯一索引，避免与新索引冲突。
 		DROP INDEX IF EXISTS idx_dashboard_daily_stats_user_date;
@@ -99,32 +107,44 @@ func (r *MetricsRepository) EnsureSchema(ctx context.Context) error {
 // ErrSnapshotNotWritten 表示工作区已删除或实时采样已跨过北京时间日期边界。
 var ErrSnapshotNotWritten = errors.New("dashboard snapshot not written")
 
-// Upsert 是实时采样与日结的唯一写入口。完整性只可提升，失败源不得清零旧值。
+// 成本合并规则（$14 = 日结写入）：完整日结直接覆盖；已完成的成本不再改；没有真实来源的写入不改成本；
+// 日内采样以最新值为准；部分日结只能抬高已有记录（两者都是全天成本的下限），不会把成本冲回更小的值。
+const mergedPurchaseSQL = `CASE
+	WHEN EXCLUDED.purchase_complete THEN EXCLUDED.today_purchase
+	WHEN old.purchase_complete OR NOT EXCLUDED.purchase_recorded THEN old.today_purchase
+	WHEN NOT $14 OR NOT old.purchase_recorded THEN EXCLUDED.today_purchase
+	ELSE GREATEST(old.today_purchase, EXCLUDED.today_purchase) END`
+
+// 营收：日结完成值直接覆盖；日内采样（非纯成本采样）在未完成时覆盖；其余保持原值。
+const mergedRevenueSQL = `CASE WHEN EXCLUDED.revenue_complete OR (NOT $14 AND NOT $16 AND NOT old.revenue_complete) THEN EXCLUDED.today_profit ELSE old.today_profit END`
+
+// Upsert 是实时采样、成本采样与日结的唯一写入口。完整性只可提升，失败源不得清零旧值。
 // 日期判定在数据库执行和冲突锁取得后重查，避免排队跨午夜的迟到采样改写历史。
 func (r *MetricsRepository) Upsert(ctx context.Context, snapshot DailySnapshot) error {
-	settlement := snapshot.RevenueComplete || snapshot.PurchaseComplete
+	settlement := snapshot.Settlement || snapshot.RevenueComplete || snapshot.PurchaseComplete
 	tag, err := r.db.Exec(ctx, `
-		INSERT INTO dashboard_daily_stats AS old (id, user_id, admin_account_id, date, today_profit, site_balance, today_purchase, net_profit, upstream_balance, created_at, revenue_complete, purchase_complete, balance_recorded)
-		SELECT $1, $2, $3, $4, $5, $6, $7, $8::double precision, $9, $10, $11, $12, $13
+		INSERT INTO dashboard_daily_stats AS old (id, user_id, admin_account_id, date, today_profit, site_balance, today_purchase, net_profit, upstream_balance, created_at, revenue_complete, purchase_complete, balance_recorded, purchase_recorded)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8::double precision, $9, $10, $11, $12, $13, $15
 		WHERE EXISTS (SELECT 1 FROM admin_accounts WHERE user_id = $2 AND id = $3)
 		AND (($14 AND $4::date < (clock_timestamp() AT TIME ZONE 'Asia/Shanghai')::date)
 		  OR (NOT $14 AND $4::date = (clock_timestamp() AT TIME ZONE 'Asia/Shanghai')::date))
 		ON CONFLICT (user_id, admin_account_id, date) DO UPDATE SET
-			today_profit = CASE WHEN EXCLUDED.revenue_complete OR (NOT $14 AND NOT old.revenue_complete) THEN EXCLUDED.today_profit ELSE old.today_profit END,
-			today_purchase = CASE WHEN EXCLUDED.purchase_complete OR (NOT $14 AND NOT old.purchase_complete) THEN EXCLUDED.today_purchase ELSE old.today_purchase END,
-			net_profit = (CASE WHEN EXCLUDED.revenue_complete OR (NOT $14 AND NOT old.revenue_complete) THEN EXCLUDED.today_profit ELSE old.today_profit END)
-			 - (CASE WHEN EXCLUDED.purchase_complete OR (NOT $14 AND NOT old.purchase_complete) THEN EXCLUDED.today_purchase ELSE old.today_purchase END),
+			today_profit = `+mergedRevenueSQL+`,
+			today_purchase = `+mergedPurchaseSQL+`,
+			net_profit = (`+mergedRevenueSQL+`) - (`+mergedPurchaseSQL+`),
 			site_balance = CASE WHEN NOT $14 AND EXCLUDED.balance_recorded THEN EXCLUDED.site_balance ELSE old.site_balance END,
 			upstream_balance = CASE WHEN NOT $14 AND EXCLUDED.balance_recorded THEN EXCLUDED.upstream_balance ELSE old.upstream_balance END,
 			revenue_complete = old.revenue_complete OR EXCLUDED.revenue_complete,
 			purchase_complete = old.purchase_complete OR EXCLUDED.purchase_complete,
 			balance_recorded = old.balance_recorded OR (NOT $14 AND EXCLUDED.balance_recorded),
+			purchase_recorded = old.purchase_recorded OR EXCLUDED.purchase_recorded,
 			created_at = EXCLUDED.created_at
 		WHERE EXISTS (SELECT 1 FROM admin_accounts WHERE user_id = EXCLUDED.user_id AND id = EXCLUDED.admin_account_id)
 		AND ($14 OR EXCLUDED.date = (clock_timestamp() AT TIME ZONE 'Asia/Shanghai')::date)
 	`, snapshot.ID, snapshot.UserID, snapshot.AdminAccountID, snapshot.Date, snapshot.TodayProfit, snapshot.SiteBalance,
 		snapshot.TodayPurchase, snapshot.TodayProfit-snapshot.TodayPurchase, snapshot.UpstreamBalance, snapshot.CreatedAt,
-		snapshot.RevenueComplete, snapshot.PurchaseComplete, snapshot.BalanceRecorded, settlement)
+		snapshot.RevenueComplete, snapshot.PurchaseComplete, snapshot.BalanceRecorded, settlement,
+		snapshot.PurchaseRecorded || snapshot.PurchaseComplete, snapshot.PurchaseSampleOnly)
 	if err != nil {
 		return err
 	}
@@ -140,7 +160,7 @@ func (r *MetricsRepository) ListRange(ctx context.Context, userID, adminAccountI
 	// 与实时指标和快照写入共用北京时间日期，不依赖数据库会话的 CURRENT_DATE。
 	today := time.Now().In(beijingLocation)
 	rows, err := r.db.Query(ctx, `
-		SELECT id, user_id, admin_account_id, date, today_profit, site_balance, today_purchase, net_profit, upstream_balance, created_at, revenue_complete, purchase_complete, balance_recorded
+		SELECT id, user_id, admin_account_id, date, today_profit, site_balance, today_purchase, net_profit, upstream_balance, created_at, revenue_complete, purchase_complete, balance_recorded, purchase_recorded
 		FROM dashboard_daily_stats
 		WHERE user_id = $1 AND admin_account_id = $2 AND date >= ($4::date - $3::int) AND date < $4::date
 		ORDER BY date ASC
@@ -154,7 +174,7 @@ func (r *MetricsRepository) ListRange(ctx context.Context, userID, adminAccountI
 	for rows.Next() {
 		var s DailySnapshot
 		if err := rows.Scan(&s.ID, &s.UserID, &s.AdminAccountID, &s.Date, &s.TodayProfit, &s.SiteBalance,
-			&s.TodayPurchase, &s.NetProfit, &s.UpstreamBalance, &s.CreatedAt, &s.RevenueComplete, &s.PurchaseComplete, &s.BalanceRecorded); err != nil {
+			&s.TodayPurchase, &s.NetProfit, &s.UpstreamBalance, &s.CreatedAt, &s.RevenueComplete, &s.PurchaseComplete, &s.BalanceRecorded, &s.PurchaseRecorded); err != nil {
 			return nil, err
 		}
 		snapshots = append(snapshots, s)

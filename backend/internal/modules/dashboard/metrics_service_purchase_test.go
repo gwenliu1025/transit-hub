@@ -20,10 +20,26 @@ func TestAggregateUpstreamMetricsForDate_FiltersPurchaseByBeijingSyncDate(t *tes
 	}
 	sites[5].Metrics.TodayConsume.Value = nil
 
-	todayPurchase, _ := aggregateUpstreamMetricsForDate(sites, targetDate)
+	todayPurchase, _, recorded := aggregateUpstreamMetricsForDate(sites, targetDate)
 
-	if todayPurchase != 35 {
-		t.Fatalf("todayPurchase = %.2f, want 35.00", todayPurchase)
+	if todayPurchase != 35 || !recorded {
+		t.Fatalf("todayPurchase = %.2f recorded=%t, want 35.00 recorded", todayPurchase, recorded)
+	}
+}
+
+// 计费站点当天都还没同步时，0 只是“没有数据”，不能当成真实成本写进日快照。
+func TestAggregateUpstreamMetricsForDate_RecordedOnlyWithSameDayData(t *testing.T) {
+	targetDate := "2026-08-04"
+	stale := []upstream.Response{
+		purchaseTestSite("previous-day", upstream.StatusConnected, 20, 2, purchaseTestTimestamp(t, "2026-08-03T23:59:59+08:00")),
+		purchaseTestSite("free", upstream.StatusConnected, 50, 0, purchaseTestTimestamp(t, "2026-08-04T12:00:00+08:00")),
+	}
+	if purchase, _, recorded := aggregateUpstreamMetricsForDate(stale, targetDate); recorded || purchase != 0 {
+		t.Fatalf("stale sites must not be recorded: purchase=%v recorded=%t", purchase, recorded)
+	}
+	// 没有计费站点时成本确实为 0。
+	if _, _, recorded := aggregateUpstreamMetricsForDate(stale[1:], targetDate); !recorded {
+		t.Fatal("workspace without paid sites has a real zero cost")
 	}
 }
 
@@ -36,7 +52,7 @@ func TestAggregateUpstreamMetricsForDate_DoesNotFilterBalanceBySyncDate(t *testi
 		purchaseTestSite("missing-rate", upstream.StatusConnected, 1, 0, purchaseTestTimestamp(t, "2026-08-04T12:00:00+08:00")),
 	}
 
-	_, upstreamBalance := aggregateUpstreamMetricsForDate(sites, targetDate)
+	_, upstreamBalance, _ := aggregateUpstreamMetricsForDate(sites, targetDate)
 
 	if upstreamBalance != 90 {
 		t.Fatalf("upstreamBalance = %.2f, want 90.00", upstreamBalance)

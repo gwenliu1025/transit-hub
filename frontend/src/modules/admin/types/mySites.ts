@@ -102,6 +102,12 @@ export interface RealConnectRequest {
   operationId?: string
 }
 
+// 后端创建账号时实际依据的上游分组平台缓存；不受“编辑类型”影响，New API 为排序后的厂商列表。
+export interface UpstreamGroupProtocolResponse {
+  upstreamPlatform: string
+  groupType: string
+}
+
 export interface NewAPIChannelType {
   id: number
   name: string

@@ -52,7 +52,7 @@ import type { ConnectionHealthStoredSummary } from '../types/connectionHealth'
 import type { DashboardColorToken, DashboardMetricData, DashboardMetricKey, DashboardPeriod } from '../types/dashboard'
 import type { DashboardAdminPlatform, Sub2apiAuthMethod } from '../types/dashboardAdmin'
 import { computeDelta, formatCny, formatDateTime } from '../utils/dashboard'
-import { dashboardDate, sumDashboardSeries } from '../utils/dashboardMetrics'
+import { averageKnownValues, dashboardDate, summarizeDashboardSeries } from '../utils/dashboardMetrics'
 
 const { t, locale } = useI18n()
 const router = useRouter()
@@ -147,8 +147,14 @@ const hydrateSnapshot = (snapshot: DashboardDataSnapshot | null): boolean => {
 const initialSnapshot = getDashboardDataSnapshot(workspaceID.value)
 hydrateSnapshot(initialSnapshot)
 
+// 每次加载都带上发起时的工作区和序号；返回时工作区已切换或已有更新的请求，就丢弃旧结果，
+// 避免把 A 工作区的数据显示成（或缓存成）B 工作区的数据。
+let operationalSequence = 0
+
 // 次要面板失败不阻断五项核心指标。三个请求都只读，其中健康摘要和余额明细只读本地缓存。
 const loadOperationalData = async () => {
+  const sequence = ++operationalSequence
+  const requestedWorkspace = workspaceID.value
   operationalLoading.value = true
   operationalLoadError.value = false
   const [groupResult, balanceResult, healthResult] = await Promise.allSettled([
@@ -156,6 +162,7 @@ const loadOperationalData = async () => {
     getUpstreamBalanceBreakdown(),
     getConnectionHealthStoredSummary(),
   ])
+  if (sequence !== operationalSequence || requestedWorkspace !== workspaceID.value) return
   groupUsageLoadError.value = groupResult.status === 'rejected'
   balanceLoadError.value = balanceResult.status === 'rejected'
   healthLoadError.value = healthResult.status === 'rejected'
@@ -165,7 +172,7 @@ const loadOperationalData = async () => {
   operationalLoadError.value = groupUsageLoadError.value || balanceLoadError.value || healthLoadError.value
   operationalLoading.value = false
 
-  const key = workspaceID.value
+  const key = requestedWorkspace
   if (key) {
     updateDashboardOperationalSnapshot(key, {
       ...(groupResult.status === 'fulfilled' ? { groupUsage: groupResult.value } : {}),
@@ -175,30 +182,38 @@ const loadOperationalData = async () => {
   }
 }
 
-const loadAllData = async (options: { skipStatusCheck?: boolean } = {}) => {
-  if (isRefreshingData.value) return
-  isRefreshingData.value = true
-  refreshDataFailed.value = false
+// 刷新进行中又收到刷新请求（切换工作区、保存余额筛选）时，不丢弃，等当前这轮结束后再跑一次。
+let queuedReload: { skipStatusCheck?: boolean } | null = null
 
-  if (!options.skipStatusCheck) {
-    await checkAdminStatus({ preserveAuthenticatedOnError: metrics.value.length > 0 })
-  }
-  if (!adminStatus.value.authenticated) {
-    initialLoading.value = false
-    isRefreshingData.value = false
+const loadAllData = async (options: { skipStatusCheck?: boolean } = {}) => {
+  if (isRefreshingData.value) {
+    queuedReload = { skipStatusCheck: (queuedReload?.skipStatusCheck ?? true) && options.skipStatusCheck }
     return
   }
+  isRefreshingData.value = true
+  refreshDataFailed.value = false
+  const requestedWorkspace = workspaceID.value
 
   try {
+    if (!options.skipStatusCheck) {
+      await checkAdminStatus({ preserveAuthenticatedOnError: metrics.value.length > 0 })
+    }
+    if (!adminStatus.value.authenticated) {
+      initialLoading.value = false
+      return
+    }
+
     const [liveData, trendsData] = await Promise.all([
       getDashboardMetrics(),
       getDashboardTrends(30),
     ])
+    // 请求期间切换了工作区：旧结果既不显示也不缓存，由排队的刷新加载新工作区。
+    if (requestedWorkspace !== workspaceID.value) return
     groupCount.value = liveData.groupCount ?? null
     applyRawData(liveData, trendsData)
     const updatedAt = Date.now()
     lastUpdatedAt.value = updatedAt
-    const key = workspaceID.value
+    const key = requestedWorkspace
     if (key) {
       const previous = getDashboardDataSnapshot(key)
       saveDashboardDataSnapshot(key, {
@@ -213,10 +228,16 @@ const loadAllData = async (options: { skipStatusCheck?: boolean } = {}) => {
     }
     void loadOperationalData()
   } catch {
-    refreshDataFailed.value = true
+    if (requestedWorkspace === workspaceID.value) refreshDataFailed.value = true
   } finally {
-    initialLoading.value = false
+    // 还有排队的刷新（如刚切换工作区）时保持加载态，避免先闪一下“加载失败”。
+    if (!queuedReload) initialLoading.value = false
     isRefreshingData.value = false
+    if (queuedReload) {
+      const next = queuedReload
+      queuedReload = null
+      void loadAllData(next)
+    }
   }
 }
 
@@ -244,7 +265,7 @@ watch(() => adminStatus.value.authenticated, (authenticated) => {
 })
 
 watch(workspaceID, (next, previous) => {
-  if (!next || next === previous || isRefreshingData.value) return
+  if (!next || next === previous) return
   groupUsage.value = null
   balanceBreakdown.value = null
   healthSummary.value = null
@@ -271,18 +292,20 @@ const percentFormatter = computed(() => new Intl.NumberFormat(locale.value, {
 }))
 const numberFormatter = computed(() => new Intl.NumberFormat(locale.value, { maximumFractionDigits: 1 }))
 
-const profitMargin = computed(() => {
-  const revenue = metric('todayProfit')?.current ?? 0
-  const profit = metric('netProfit')?.current ?? 0
-  return revenue > 0 ? (profit / revenue) * 100 : 0
-})
+// 营收为 0（如刚过零点）或为负时利润率没有意义，显示“暂无”而不是 0%。
+const marginOf = (revenue: number | undefined, profit: number | undefined): number | null => (
+  revenue !== undefined && profit !== undefined && revenue > 0 ? (profit / revenue) * 100 : null
+)
+
+const profitMargin = computed(() => marginOf(metric('todayProfit')?.current, metric('netProfit')?.current))
 
 const marginSeries = computed(() => {
   const revenue = metric('todayProfit')?.comparison ?? []
   const profit = metric('netProfit')?.comparison ?? []
-  // 收入可单独完整，但利润率必须同时具备昨日收入与净利。
+  // 收入可单独完整，但利润率必须同时具备昨日收入与净利；任一天利润率无意义时不做对比。
   if (revenue.length !== 2 || profit.length !== 2) return []
-  return revenue.map((point, index) => point.value > 0 ? (profit[index].value / point.value) * 100 : 0)
+  const series = revenue.map((point, index) => marginOf(point.value, profit[index].value))
+  return series.every(value => value !== null) ? series as number[] : []
 })
 
 interface DashboardCoreCard {
@@ -325,7 +348,7 @@ const cards = computed<DashboardCoreCard[]>(() => {
     label: t('admin.dashboard.metrics.profitMargin'),
     icon: Gauge,
     color: 'accent',
-    value: percentFormatter.value.format(profitMargin.value / 100),
+    value: profitMargin.value === null ? t('admin.dashboard.common.unavailable') : percentFormatter.value.format(profitMargin.value / 100),
     deltaDirection: marginDelta.direction,
     deltaText: hasYesterdayMargin ? t('admin.dashboard.delta.percentagePoints', { value: numberFormatter.value.format(Math.abs(marginDelta.amount)) }) : '',
     deltaCaption: t(hasYesterdayMargin ? 'admin.dashboard.delta.vsPrev' : 'admin.dashboard.delta.missingYesterday'),
@@ -338,12 +361,19 @@ const cards = computed<DashboardCoreCard[]>(() => {
 const period = ref<DashboardPeriod>('week')
 const periods: DashboardPeriod[] = ['week', 'month']
 const selectedSeries = (key: DashboardMetricKey) => metric(key)?.series[period.value] ?? []
-const sumSeries = (key: DashboardMetricKey) => sumDashboardSeries(selectedSeries(key))
+// 周期总额只合计有数据的日子，缺数据的天数单独提示，不再因为个别日缺数据隐藏整个周期。
+const summarizeSeries = (key: DashboardMetricKey) => summarizeDashboardSeries(selectedSeries(key))
+
+const periodSummaries = computed(() => ({
+  revenue: summarizeSeries('todayProfit'),
+  cost: summarizeSeries('todayPurchase'),
+  profit: summarizeSeries('netProfit'),
+}))
 
 const periodTotals = computed(() => ({
-  revenue: sumSeries('todayProfit'),
-  cost: sumSeries('todayPurchase'),
-  profit: sumSeries('netProfit'),
+  revenue: periodSummaries.value.revenue.total,
+  cost: periodSummaries.value.cost.total,
+  profit: periodSummaries.value.profit.total,
 }))
 
 const compactCurrency = (value: number) => {
@@ -478,14 +508,16 @@ const groupChartOption = computed<EChartsCoreOption>(() => {
   }
 })
 
-const siteBalance = computed(() => metric('siteBalance')?.current ?? 0)
-const upstreamBalance = computed(() => metric('upstreamBalance')?.current ?? 0)
-const coverageRatio = computed(() => siteBalance.value > 0 ? (upstreamBalance.value / siteBalance.value) * 100 : null)
-const averageDailyCost = computed(() => {
-  const points = selectedSeries('todayPurchase')
-  const total = sumDashboardSeries(points)
-  return total === null ? null : total / points.length
+// 实时站点余额读取失败时为未知（显示 ¥—），不当成 ¥0。
+const siteBalance = computed(() => {
+  const current = metric('siteBalance')
+  return current && current.currentKnown !== false ? current.current : null
 })
+const upstreamBalance = computed(() => metric('upstreamBalance')?.current ?? 0)
+const coverageRatio = computed(() => siteBalance.value !== null && siteBalance.value > 0 ? (upstreamBalance.value / siteBalance.value) * 100 : null)
+// 续航按最近 7 个完整自然日（不含今天的部分值）的日均成本估算，不随本周/本月切换而跳变；
+// 成本未记录的日子不参与平均。
+const averageDailyCost = computed(() => averageKnownValues(metric('todayPurchase')?.recent ?? []))
 const runwayDays = computed(() => averageDailyCost.value !== null && averageDailyCost.value > 0 ? upstreamBalance.value / averageDailyCost.value : null)
 const coverageWidth = computed(() => `${Math.min(coverageRatio.value ?? 0, 100)}%`)
 const coverageTone = computed(() => {
@@ -725,17 +757,20 @@ const lastProbeLabel = computed(() => {
               <div class="min-w-0 px-2 first:pl-0 sm:px-4">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodRevenue') }}</dt>
                 <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-foreground sm:text-base">{{ formatCny(periodTotals.revenue) }}</dd>
-                <dd v-if="periodTotals.revenue === null" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.incomplete') }}</dd>
+                <dd v-if="periodSummaries.revenue.missingDays > 0" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.missingDays', { count: periodSummaries.revenue.missingDays }) }}</dd>
               </div>
               <div class="min-w-0 px-2 sm:px-4">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodCost') }}</dt>
                 <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-foreground sm:text-base">{{ formatCny(periodTotals.cost) }}</dd>
-                <dd v-if="periodTotals.cost === null" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.incomplete') }}</dd>
+                <dd v-if="periodSummaries.cost.missingDays > 0" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.missingDays', { count: periodSummaries.cost.missingDays }) }}</dd>
               </div>
               <div class="min-w-0 px-2 pr-0 sm:px-4 sm:pr-0">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodProfit') }}</dt>
-                <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-signal sm:text-base">{{ formatCny(periodTotals.profit) }}</dd>
-                <dd v-if="periodTotals.profit === null" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.incomplete') }}</dd>
+                <dd
+                  class="mt-1 truncate text-sm font-semibold tabular-nums sm:text-base"
+                  :class="periodTotals.profit !== null && periodTotals.profit < 0 ? 'text-red-500 dark:text-red-400' : 'text-signal'"
+                >{{ formatCny(periodTotals.profit) }}</dd>
+                <dd v-if="periodSummaries.profit.missingDays > 0" class="mt-1 text-xs text-muted-foreground">{{ t('admin.dashboard.performance.missingDays', { count: periodSummaries.profit.missingDays }) }}</dd>
               </div>
             </dl>
 

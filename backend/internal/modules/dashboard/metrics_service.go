@@ -42,11 +42,27 @@ type dailyRevenueSource interface {
 }
 
 type dailyPurchaseSource interface {
-	WithDailyPurchaseForAccount(context.Context, string, string, string, func(context.Context, float64) error) error
+	WithDailyPurchaseForAccount(context.Context, string, string, string, func(context.Context, upstream.DailyPurchaseResult) error) error
+}
+
+// staleSiteSyncer 让成本采样在后台定时同步关闭时也能拿到当天的上游消费。
+type staleSiteSyncer interface {
+	SyncStaleForAccount(context.Context, string, string, time.Duration)
 }
 
 var _ dailyRevenueSource = (*upstream.PlatformService)(nil)
 var _ dailyPurchaseSource = (*upstream.Service)(nil)
+var _ staleSiteSyncer = (*upstream.Service)(nil)
+
+const (
+	// 日结补跑窗口：昨日营收/成本未完成时每小时重试；更早几天只补“完全没有成本记录”的日子。
+	purchaseRetryDays = 7
+	// 成本采样间隔；23:58 额外采样一次，让日内成本尽量接近全天。
+	purchaseSampleInterval = 10 * time.Minute
+	// 采样前补同步超过该时长未成功同步的上游站点（后台定时同步关闭时尤其需要）。
+	staleSiteAge         = 30 * time.Minute
+	endOfDayStaleSiteAge = 5 * time.Minute
+)
 
 // MetricsService 负责仪表盘指标的实时计算、历史快照存储与午夜调度。
 // 与同包的 Service（admin 会话管理）职责分离，共享 SessionStore 和 PlatformClient。
@@ -174,14 +190,15 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 	// 营收失败必须返回错误，防止零值污染持久化；其它实时读取保留既有口径。
 	today := beijingMetricDate(s.clock())
 	var (
-		todayProfit     float64
-		siteBalance     float64
-		groupCount      int
-		todayPurchase   float64
-		upstreamBalance float64
-		wg              sync.WaitGroup
-		revenueErr      error
-		balanceRecorded bool
+		todayProfit      float64
+		siteBalance      float64
+		groupCount       int
+		todayPurchase    float64
+		upstreamBalance  float64
+		wg               sync.WaitGroup
+		revenueErr       error
+		balanceRecorded  bool
+		purchaseRecorded bool
 	)
 
 	// goroutine 1: 今日盈利额度（平台中性）。
@@ -235,7 +252,7 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		todayPurchase, upstreamBalance = aggregateUpstreamMetricsForDate(s.upstreams.List(ctx, userID), today)
+		todayPurchase, upstreamBalance, purchaseRecorded = aggregateUpstreamMetricsForDate(s.upstreams.List(ctx, userID), today)
 	}()
 
 	wg.Wait()
@@ -258,10 +275,12 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 		NetProfit:       netProfit,
 		UpstreamBalance: upstreamBalance,
 		GroupCount:      groupCount,
+		Date:            today,
+		BalanceRecorded: balanceRecorded,
 	}
 
 	// 营收源失败或请求跨日时不写日内采样；数据库还会复查真正执行时的日期。
-	if err := s.upsertSnapshot(ctx, userID, adminAccountID, today, result, balanceRecorded); err != nil {
+	if err := s.upsertSnapshot(ctx, userID, adminAccountID, today, result, balanceRecorded, purchaseRecorded); err != nil {
 		return MetricsResponse{}, err
 	}
 
@@ -288,6 +307,7 @@ func (s *MetricsService) Trends(ctx context.Context, userID string, days int) (T
 		points = append(points, TrendPoint{
 			RevenueComplete:  snap.RevenueComplete,
 			PurchaseComplete: snap.PurchaseComplete,
+			PurchaseRecorded: snap.PurchaseRecorded || snap.PurchaseComplete,
 			BalanceRecorded:  snap.BalanceRecorded,
 			Date:             snap.Date.Format("2006-01-02"),
 			TodayProfit:      snap.TodayProfit,
@@ -300,33 +320,60 @@ func (s *MetricsService) Trends(ctx context.Context, userID string, days int) (T
 	return TrendResponse{Points: points}, nil
 }
 
-// StartScheduler 启动时仅修复昨日营收；计划日结按当时冻结配置结算昨日成本。
+// StartScheduler 启动日结与成本采样两个后台任务：
+//   - 日结：启动时与每小时 xx:05 检查最近几天，补跑昨日未完成的营收/成本，以及更早几天完全缺失的成本；
+//   - 采样：每 10 分钟（另加 23:58）把各工作区当日成本写入日内快照，不依赖有人打开仪表盘。
 func (s *MetricsService) StartScheduler(ctx context.Context) {
 	go func() {
-		if err := s.reconcileAll(ctx, false); err != nil {
-			log.Printf("dashboard startup reconciliation failed: %v", err)
+		if err := s.settlePending(ctx); err != nil {
+			log.Printf("dashboard startup settlement incomplete: %v", err)
 		}
 		for {
 			now := s.clock().In(beijingLocation)
-			next := nextSettlementTime(now)
-			timer := time.NewTimer(next.Sub(now))
+			timer := time.NewTimer(nextSettlementTime(now).Sub(now))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return
 			case <-timer.C:
-				s.snapshotAll(ctx)
+				if err := s.settlePending(ctx); err != nil {
+					log.Printf("dashboard daily settlement incomplete: %v", err)
+				}
+			}
+		}
+	}()
+	go func() {
+		for {
+			now := s.clock().In(beijingLocation)
+			timer := time.NewTimer(nextPurchaseSampleTime(now).Sub(now))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+				s.samplePurchaseAll(ctx)
 			}
 		}
 	}()
 }
 
-// 日志聚合存在落库水位，避开整点尚未收敛的窗口；启动补偿使用同一边界。
+// 日志聚合存在落库水位，避开整点尚未收敛的窗口；之后每小时同一分钟重试未完成的日结。
 func nextSettlementTime(now time.Time) time.Time {
 	now = now.In(beijingLocation)
-	next := time.Date(now.Year(), now.Month(), now.Day(), 0, 5, 0, 0, beijingLocation)
+	next := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 5, 0, 0, beijingLocation)
 	if !next.After(now) {
-		next = next.AddDate(0, 0, 1)
+		next = next.Add(time.Hour)
+	}
+	return next
+}
+
+// nextPurchaseSampleTime 每 10 分钟采样一次，并在 23:58 追加一次，缩小日终未采到的空档。
+func nextPurchaseSampleTime(now time.Time) time.Time {
+	now = now.In(beijingLocation)
+	next := now.Truncate(purchaseSampleInterval).Add(purchaseSampleInterval)
+	endOfDay := time.Date(now.Year(), now.Month(), now.Day(), 23, 58, 0, 0, beijingLocation)
+	if now.Before(endOfDay) && endOfDay.Before(next) {
+		return endOfDay
 	}
 	return next
 }
@@ -336,36 +383,66 @@ func settlementWindowReady(now time.Time) bool {
 	return now.Hour() > 0 || now.Minute() >= 5
 }
 
-func (s *MetricsService) snapshotAll(ctx context.Context) {
-	if err := s.reconcileAll(ctx, true); err != nil {
-		log.Printf("dashboard daily settlement failed: %v", err)
-	}
-}
-
-func (s *MetricsService) reconcileAll(ctx context.Context, purchase bool) error {
+// settlePending 补跑最近几天未完成的日结。昨日：营收或成本未完成即重试（成本按当前倍率，
+// 与每晚日结口径一致）；更早的日子只补“完全没有成本记录”的成本，不改写已有的采样或已结算值。
+func (s *MetricsService) settlePending(ctx context.Context) error {
 	if !settlementWindowReady(s.clock()) {
 		return nil
 	}
-	// 单批次和单工作区都有限时；一次失败不会无限重试或切到其它身份。
+	// 单批次和单工作区都有限时；一次失败只等下一个小时重试，不会无限重试或切到其它身份。
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	refs, err := s.store.ActiveSessions(ctx)
 	if err != nil {
 		return err
 	}
-	date := previousBeijingMetricDate(s.clock())
+	yesterday := previousBeijingMetricDate(s.clock())
 	var failures []error
 	for _, ref := range refs {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(failures, err)...)
 		}
-		if err := s.reconcileDate(ctx, ref.UserID, ref.AdminAccountID, date, purchase); err != nil {
-			failures = append(failures, fmt.Errorf("workspace %s/%s: %w", ref.UserID, ref.AdminAccountID, err))
+		rows, err := s.metricsRepo.ListRange(ctx, ref.UserID, ref.AdminAccountID, purchaseRetryDays)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("workspace %s/%s: list: %w", ref.UserID, ref.AdminAccountID, err))
 			continue
 		}
-		log.Printf("dashboard reconciliation saved user_id=%s admin_account_id=%s date=%s purchase=%t", ref.UserID, ref.AdminAccountID, date, purchase)
+		for _, job := range pendingSettlements(rows, yesterday) {
+			if err := s.reconcileDate(ctx, ref.UserID, ref.AdminAccountID, job.date, job.revenue, job.purchase); err != nil {
+				failures = append(failures, fmt.Errorf("workspace %s/%s date %s: %w", ref.UserID, ref.AdminAccountID, job.date, err))
+				continue
+			}
+			log.Printf("dashboard settlement saved user_id=%s admin_account_id=%s date=%s revenue=%t purchase=%t", ref.UserID, ref.AdminAccountID, job.date, job.revenue, job.purchase)
+		}
 	}
 	return errors.Join(failures...)
+}
+
+type settlementJob struct {
+	date              string
+	revenue, purchase bool
+}
+
+func pendingSettlements(rows []DailySnapshot, yesterday string) []settlementJob {
+	jobs := make([]settlementJob, 0, 2)
+	var current *DailySnapshot
+	for i := range rows {
+		date := rows[i].Date.Format("2006-01-02")
+		if date == yesterday {
+			current = &rows[i]
+			continue
+		}
+		if date < yesterday && !rows[i].PurchaseComplete && !rows[i].PurchaseRecorded {
+			jobs = append(jobs, settlementJob{date: date, purchase: true})
+		}
+	}
+	if current == nil {
+		return append(jobs, settlementJob{date: yesterday, revenue: true, purchase: true})
+	}
+	if !current.RevenueComplete || !current.PurchaseComplete {
+		jobs = append(jobs, settlementJob{date: yesterday, revenue: !current.RevenueComplete, purchase: !current.PurchaseComplete})
+	}
+	return jobs
 }
 
 // ReconcileRevenue 仅从仍有完整日志的真实昨日恢复营收，不将今天倍率追溯应用于历史成本。
@@ -374,7 +451,7 @@ func (s *MetricsService) ReconcileRevenue(ctx context.Context, userID, adminAcco
 	if date != previousBeijingMetricDate(s.clock()) || !settlementWindowReady(s.clock()) {
 		return errors.New("dashboard revenue source only supports settled yesterday")
 	}
-	return s.reconcileDate(ctx, userID, adminAccountID, date, false)
+	return s.reconcileDate(ctx, userID, adminAccountID, date, true, false)
 }
 
 // ApplyVerifiedRevenue 接收调用方已核对覆盖范围与完整性的权威日汇总。
@@ -393,13 +470,22 @@ func (s *MetricsService) ApplyVerifiedRevenue(ctx context.Context, userID, admin
 	return s.metricsRepo.Upsert(ctx, DailySnapshot{ID: id, UserID: userID, AdminAccountID: adminAccountID, Date: parsed, TodayProfit: amount, RevenueComplete: true, CreatedAt: s.clock()})
 }
 
-func (s *MetricsService) reconcileDate(ctx context.Context, userID, adminAccountID, date string, purchase bool) error {
+// reconcileDate 结算一个历史日。营收只对昨日开放（日志有保留期）；成本对最近几天开放。
+// 成本部分成功时照常落账（标记未完成），失败站点稍后重试，避免一个异常站点让整天成本记成 0。
+func (s *MetricsService) reconcileDate(ctx context.Context, userID, adminAccountID, date string, revenue, purchase bool) error {
 	parsed, err := time.ParseInLocation("2006-01-02", date, beijingLocation)
 	if err != nil || date >= beijingMetricDate(s.clock()) || userID == "" || adminAccountID == "" {
 		return errors.New("dashboard reconciliation requires a historical date and workspace")
 	}
-	if purchase && date != previousBeijingMetricDate(s.clock()) {
-		return errors.New("dashboard purchase settlement requires yesterday")
+	if revenue && date != previousBeijingMetricDate(s.clock()) {
+		return errors.New("dashboard revenue settlement requires yesterday")
+	}
+	oldest := s.clock().In(beijingLocation).AddDate(0, 0, -purchaseRetryDays).Format("2006-01-02")
+	if purchase && date < oldest {
+		return errors.New("dashboard purchase settlement outside retry window")
+	}
+	if !revenue && !purchase {
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
@@ -407,20 +493,22 @@ func (s *MetricsService) reconcileDate(ctx context.Context, userID, adminAccount
 	if err != nil {
 		return err
 	}
-	snapshot := DailySnapshot{ID: id, UserID: userID, AdminAccountID: adminAccountID, Date: parsed, CreatedAt: s.clock()}
+	snapshot := DailySnapshot{ID: id, UserID: userID, AdminAccountID: adminAccountID, Date: parsed, CreatedAt: s.clock(), Settlement: true}
 	var failures []error
-	record, err := s.store.Get(ctx, userID, adminAccountID)
-	if err == nil && (record == nil || !record.Session.IsAuthenticated()) {
-		err = requestError(ErrorAdminOnly)
-	}
-	if err == nil {
-		// 日结只消费当前会话，刷新与持久化仍归既有会话 owner。
-		snapshot.TodayProfit, err = s.revenue(ctx, record.Session, date)
-	}
-	if err != nil {
-		failures = append(failures, fmt.Errorf("revenue: %w", err))
-	} else {
-		snapshot.RevenueComplete = true
+	if revenue {
+		record, err := s.store.Get(ctx, userID, adminAccountID)
+		if err == nil && (record == nil || !record.Session.IsAuthenticated()) {
+			err = requestError(ErrorAdminOnly)
+		}
+		if err == nil {
+			// 日结只消费当前会话，刷新与持久化仍归既有会话 owner。
+			snapshot.TodayProfit, err = s.revenue(ctx, record.Session, date)
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("revenue: %w", err))
+		} else {
+			snapshot.RevenueComplete = true
+		}
 	}
 	if purchase {
 		source, ok := s.upstreams.(dailyPurchaseSource)
@@ -428,16 +516,20 @@ func (s *MetricsService) reconcileDate(ctx context.Context, userID, adminAccount
 		if !ok {
 			err = errors.New("dashboard daily purchase source unavailable")
 		} else {
-			err = source.WithDailyPurchaseForAccount(ctx, userID, adminAccountID, date, func(commitCtx context.Context, amount float64) error {
+			err = source.WithDailyPurchaseForAccount(ctx, userID, adminAccountID, date, func(commitCtx context.Context, result upstream.DailyPurchaseResult) error {
 				// 配置 owner 在此回调返回前保持冻结；日结唯一写入必须发生在其锁内。
 				consumed = true
 				if err := commitCtx.Err(); err != nil {
 					return err
 				}
-				snapshot.TodayPurchase = amount
-				snapshot.PurchaseComplete = true
+				snapshot.TodayPurchase = result.Amount
+				snapshot.PurchaseComplete = result.Complete
+				snapshot.PurchaseRecorded = true
 				if err := s.metricsRepo.Upsert(commitCtx, snapshot); err != nil {
 					return fmt.Errorf("persist: %w", err)
+				}
+				if !result.Complete {
+					return fmt.Errorf("purchase incomplete: %d/%d sites failed: %w", result.FailedSites, result.TotalSites, result.Cause)
 				}
 				return nil
 			})
@@ -458,7 +550,7 @@ func (s *MetricsService) reconcileDate(ctx context.Context, userID, adminAccount
 	if err := ctx.Err(); err != nil {
 		return errors.Join(append(failures, err)...)
 	}
-	if snapshot.RevenueComplete || snapshot.PurchaseComplete {
+	if snapshot.RevenueComplete {
 		if err := s.metricsRepo.Upsert(ctx, snapshot); err != nil {
 			failures = append(failures, fmt.Errorf("persist: %w", err))
 		}
@@ -466,19 +558,76 @@ func (s *MetricsService) reconcileDate(ctx context.Context, userID, adminAccount
 	return errors.Join(failures...)
 }
 
-func aggregateUpstreamMetricsForDate(sites []upstream.Response, targetDate string) (todayPurchase, upstreamBalance float64) {
+// samplePurchaseAll 为所有工作区写入当日成本采样。日结若当晚失败，这份接近全天的采样就是成本兜底，
+// 不再依赖当天有人打开仪表盘。采样只更新成本，不碰营收与余额。
+func (s *MetricsService) samplePurchaseAll(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+	refs, err := s.store.ActiveSessions(ctx)
+	if err != nil {
+		log.Printf("dashboard purchase sample: list workspaces failed: %v", err)
+		return
+	}
+	for _, ref := range refs {
+		if err := s.samplePurchase(ctx, ref.UserID, ref.AdminAccountID); err != nil && !errors.Is(err, ErrSnapshotNotWritten) {
+			log.Printf("dashboard purchase sample failed user_id=%s admin_account_id=%s err=%v", ref.UserID, ref.AdminAccountID, err)
+		}
+	}
+}
+
+func (s *MetricsService) samplePurchase(ctx context.Context, userID, adminAccountID string) error {
+	now := s.clock().In(beijingLocation)
+	if syncer, ok := s.upstreams.(staleSiteSyncer); ok {
+		maxAge := staleSiteAge
+		if now.Hour() == 23 && now.Minute() >= 40 {
+			maxAge = endOfDayStaleSiteAge
+		}
+		syncer.SyncStaleForAccount(ctx, userID, adminAccountID, maxAge)
+	}
+	today := beijingMetricDate(now)
+	purchase, _, recorded := aggregateUpstreamMetricsForDate(s.upstreams.ListForAccount(ctx, userID, adminAccountID), today)
+	if !recorded || beijingMetricDate(s.clock()) != today {
+		return nil
+	}
+	parsed, err := time.Parse("2006-01-02", today)
+	if err != nil {
+		return err
+	}
+	id, err := metricsRandomID()
+	if err != nil {
+		return err
+	}
+	return s.metricsRepo.Upsert(ctx, DailySnapshot{
+		ID:                 id,
+		UserID:             userID,
+		AdminAccountID:     adminAccountID,
+		Date:               parsed,
+		TodayPurchase:      purchase,
+		PurchaseRecorded:   true,
+		PurchaseSampleOnly: true,
+		CreatedAt:          s.clock(),
+	})
+}
+
+// aggregateUpstreamMetricsForDate 汇总当日成本与上游余额；recorded 表示成本有真实来源：
+// 没有计费站点（成本确为 0），或至少一个计费站点在该北京日同步过今日消费。
+func aggregateUpstreamMetricsForDate(sites []upstream.Response, targetDate string) (todayPurchase, upstreamBalance float64, recorded bool) {
+	paidSites := 0
+	contributed := 0
 	for _, site := range sites {
 		if site.RechargeRate <= 0 {
 			continue
 		}
+		paidSites++
 		if site.Metrics.TodayConsume.Value != nil && syncedOnBeijingDate(site.LastSyncedAt, targetDate) {
 			todayPurchase += *site.Metrics.TodayConsume.Value * site.RechargeRate
+			contributed++
 		}
 		if site.Metrics.Balance.Value != nil {
 			upstreamBalance += *site.Metrics.Balance.Value * site.RechargeRate
 		}
 	}
-	return todayPurchase, upstreamBalance
+	return todayPurchase, upstreamBalance, paidSites == 0 || contributed > 0
 }
 
 func beijingMetricDate(now time.Time) string {
@@ -497,7 +646,7 @@ func syncedOnBeijingDate(lastSyncedAt *int64, targetDate string) bool {
 }
 
 // upsertSnapshot 提交日内采样，数据库负责日期门禁与已完成字段保护。
-func (s *MetricsService) upsertSnapshot(ctx context.Context, userID, adminAccountID, date string, metrics MetricsResponse, balanceRecorded bool) error {
+func (s *MetricsService) upsertSnapshot(ctx context.Context, userID, adminAccountID, date string, metrics MetricsResponse, balanceRecorded, purchaseRecorded bool) error {
 	parsedDate, err := time.Parse("2006-01-02", date)
 	if err != nil {
 		return err
@@ -518,6 +667,8 @@ func (s *MetricsService) upsertSnapshot(ctx context.Context, userID, adminAccoun
 		UpstreamBalance: metrics.UpstreamBalance,
 		CreatedAt:       s.clock(),
 		BalanceRecorded: balanceRecorded,
+		// 没有任何计费站点在今天同步过时，0 只是“还没数据”，不能覆盖已有的成本采样。
+		PurchaseRecorded: purchaseRecorded,
 	}
 	return s.metricsRepo.Upsert(ctx, snapshot)
 }
@@ -619,7 +770,7 @@ func (s *MetricsService) GroupUsageToday(ctx context.Context, userID string) (Gr
 	}
 
 	return GroupUsageTodayResponse{
-		Date:   time.Now().Format("2006-01-02"),
+		Date:   beijingMetricDate(s.clock()),
 		Total:  total,
 		Groups: items,
 	}, nil
@@ -665,7 +816,7 @@ func (s *MetricsService) UpstreamKeyUsageToday(ctx context.Context, userID strin
 	}
 
 	return UpstreamKeyUsageTodayResponse{
-		Date:        time.Now().Format("2006-01-02"),
+		Date:        beijingMetricDate(s.clock()),
 		Total:       total,
 		Keys:        responseItems,
 		FailedSites: failedSites,

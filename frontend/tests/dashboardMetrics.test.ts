@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
 import { computed, ref } from 'vue'
-import { buildDashboardMetrics, dashboardDate, sumDashboardSeries } from '../src/modules/admin/utils/dashboardMetrics.ts'
+import { averageKnownValues, buildDashboardMetrics, dashboardDate, summarizeDashboardSeries, sumDashboardSeries } from '../src/modules/admin/utils/dashboardMetrics.ts'
 import { computeDelta, formatCny } from '../src/modules/admin/utils/dashboard.ts'
 import zh from '../src/locales/zh-CN.ts'
 import en from '../src/locales/en-US.ts'
@@ -177,8 +177,8 @@ test('中英文缺昨日文案不将缺失表达为零差额', () => {
   assert.equal(en.admin.dashboard.delta.missingYesterday, 'Yesterday’s data unavailable')
 })
 
-// 用户采用既有成本与净利；营收和余额仍保留原完整性门禁。
-test('成本净利采用现有记录，营收和余额门禁不变，日期轴始终对齐', () => {
+// 成本采用既有记录；净利润 = 营收 − 成本，营收未确认时净利同为未知；余额仍保留原完整性门禁。
+test('成本采用现有记录，营收未确认时净利未知，余额门禁不变，日期轴始终对齐', () => {
   const metrics = buildDashboardMetrics(values(100), [
     { date: '2026-09-07', ...values(20), revenueComplete: false, balanceRecorded: false },
     { date: '2026-09-08', ...values(40), purchaseComplete: false, balanceRecorded: false },
@@ -188,15 +188,16 @@ test('成本净利采用现有记录，营收和余额门禁不变，日期轴�
   const profit = metrics.find(item => item.key === 'netProfit')!
   assert.deepEqual(revenue.series.week.map(point => point.value), [null, 40, 100])
   assert.deepEqual(cost.series.week.map(point => point.value), [5, 10, 25])
-  assert.deepEqual(profit.series.week.map(point => point.value), [15, 30, 75])
+  assert.deepEqual(profit.series.week.map(point => point.value), [null, 30, 75])
   assert.equal(revenue.comparison.length, 2)
   assert.equal(cost.comparison.length, 2)
   assert.equal(profit.comparison.length, 2)
   for (const metric of metrics) {
     assert.deepEqual(metric.series.week.map(point => point.label), ['9/7', '9/8', '9/9'])
-    const expected = metric.key === 'todayPurchase' ? 40 : metric.key === 'netProfit' ? 120 : null
+    const expected = metric.key === 'todayPurchase' ? 40 : null
     assert.equal(sumDashboardSeries(metric.series.week), expected)
   }
+  assert.deepEqual(summarizeDashboardSeries(profit.series.week), { total: 105, missingDays: 1 })
   for (const key of ['siteBalance', 'upstreamBalance']) {
     const metric = metrics.find(item => item.key === key)!
     assert.ok(metric.series.week.slice(0, -1).every(point => point.value === null))
@@ -204,13 +205,13 @@ test('成本净利采用现有记录，营收和余额门禁不变，日期轴�
   }
 })
 
-test('旧响应缺标志或非布尔真值仍展示成本净利，不放宽营收与余额', () => {
+test('旧响应缺标志或非布尔真值仍展示成本，不放宽营收、净利与余额', () => {
   for (const complete of [undefined, false, 1, 'true']) {
     const point = { date: '2026-09-08', ...values(40), revenueComplete: complete, purchaseComplete: complete, balanceRecorded: complete }
     // 模拟运行时旧缓存或不符合接口声明的响应。
     const metrics = buildDashboardMetrics(values(100), [point as never], new Date('2026-09-09T04:00:00Z'))
     for (const metric of metrics) {
-      const adopted = metric.key === 'todayPurchase' || metric.key === 'netProfit'
+      const adopted = metric.key === 'todayPurchase'
       assert.equal(metric.comparison.length, adopted ? 2 : 1)
       assert.equal(metric.series.week[1].value, adopted ? values(40)[metric.key] : null)
       assert.equal(sumDashboardSeries(metric.series.week), null)
@@ -237,7 +238,7 @@ test('周期全日完整才有总额，已确认零值保留为零，缺行与�
 })
 
 // 运行页面现有计算代码，验证真实消费者，而非在测试里另写卡片和图表规则。
-test('页面恢复既有成本净利的卡片、图表、总额、利润率与续航，并保留真实缺口', () => {
+test('页面卡片、图表、总额、利润率与续航采用现有成本，缺口单独提示且不清空整个周期', () => {
   const source = readFileSync(new URL('../src/modules/admin/views/DashboardView.vue', import.meta.url), 'utf8')
   const start = source.indexOf('const METRIC_META:')
   const end = source.indexOf('const sortedGroups =')
@@ -249,13 +250,13 @@ test('页面恢复既有成本净利的卡片、图表、总额、利润率与�
     { date: '2026-09-08', ...values(40), purchaseComplete: false, netProfit: -17 },
   ], new Date('2026-09-09T04:00:00Z')))
   const context = {
-    computed, ref, metrics, locale: ref('zh-CN'), computeDelta, formatCny, sumDashboardSeries,
+    computed, ref, metrics, locale: ref('zh-CN'), computeDelta, formatCny, summarizeDashboardSeries, averageKnownValues,
     t: (key: string) => key,
     TrendingUp: {}, Wallet: {}, ShoppingCart: {}, PiggyBank: {}, Landmark: {}, Gauge: {},
     chartTheme: ref({ muted: '#777', card: '#fff', border: '#ccc', foreground: '#111', primary: '#00f', warning: '#fa0', signal: '#0a0' }),
   }
   const script = source.slice(start, end) + source.slice(capitalStart, capitalEnd)
-    + '\n;({ cards, period, periodTotals, performanceChartOption, runwayDays, marginSeries })'
+    + '\n;({ cards, period, periodTotals, periodSummaries, performanceChartOption, runwayDays, marginSeries, siteBalance, coverageRatio })'
   const result = runInNewContext(ts.transpile(script, { target: ts.ScriptTarget.ES2022 }), context)
   assert.equal(result.cards.value.length, 4)
   assert.equal(result.cards.value[0].deltaCaption, 'admin.dashboard.delta.vsPrev')
@@ -268,7 +269,8 @@ test('页面恢复既有成本净利的卡片、图表、总额、利润率与�
   assert.equal(result.periodTotals.value.revenue, 160)
   assert.equal(result.periodTotals.value.cost, 40)
   assert.equal(result.periodTotals.value.profit, 73)
-  assert.equal(result.runwayDays.value, 22.5)
+  // 续航只看最近 7 个完整日（不含今天的部分值）：9/7 成本 5、9/8 成本 10，日均 7.5。
+  assert.equal(result.runwayDays.value, 40)
   const chart = result.performanceChartOption.value
   assert.deepEqual(Array.from(chart.xAxis.data), ['9/7', '9/8', '9/9'])
   assert.deepEqual(Array.from(chart.series[0].data), [20, 40, 100])
@@ -276,7 +278,9 @@ test('页面恢复既有成本净利的卡片、图表、总额、利润率与�
   assert.deepEqual(Array.from(chart.series[2].data), [15, -17, 75])
   assert.equal(chart.series[2].connectNulls, false)
   result.period.value = 'month'
-  assert.equal(result.periodTotals.value.revenue, null)
+  // 月初几天没有记录时只合计有数据的日子，并报告缺失天数，不再把整月总额隐藏。
+  assert.equal(result.periodTotals.value.revenue, 160)
+  assert.equal(result.periodSummaries.value.revenue.missingDays, 6)
   assert.equal(result.performanceChartOption.value.xAxis.data.length, 9)
 
   result.period.value = 'week'
@@ -284,14 +288,16 @@ test('页面恢复既有成本净利的卡片、图表、总额、利润率与�
     { date: '2026-09-07', ...values(20) },
     { date: '2026-09-08', ...values(0) },
   ], new Date('2026-09-09T04:00:00Z'))
-  for (const card of result.cards.value) {
+  for (const card of result.cards.value.slice(0, 3)) {
     assert.equal(card.deltaCaption, 'admin.dashboard.delta.vsPrev')
     assert.notEqual(card.deltaText, '')
   }
+  // 昨日营收为 0 时昨日利润率无意义，不做利润率对比。
+  assert.equal(result.cards.value[3].deltaText, '')
   assert.equal(result.periodTotals.value.revenue, 120)
   assert.equal(result.periodTotals.value.cost, 30)
   assert.equal(result.periodTotals.value.profit, 90)
-  assert.equal(result.runwayDays.value, 30)
+  assert.equal(result.runwayDays.value, 120)
 
   // 整月旧标志不再隐藏现有成本和净利，页面仍直接消费存储负净利。
   metrics.value = buildDashboardMetrics(values(100), Array.from({ length: 29 }, (_, day) => ({
@@ -300,7 +306,7 @@ test('页面恢复既有成本净利的卡片、图表、总额、利润率与�
   result.period.value = 'month'
   assert.equal(result.periodTotals.value.cost, 83)
   assert.equal(result.periodTotals.value.profit, -12)
-  assert.equal(result.runwayDays.value, 300 / (83 / 30))
+  assert.equal(result.runwayDays.value, 150)
   assert.equal(result.performanceChartOption.value.series[1].data.length, 30)
   assert.ok(result.performanceChartOption.value.series[1].data.every((value: number | null) => value !== null))
   assert.equal(result.cards.value[1].deltaText, '¥23.00')
@@ -315,17 +321,32 @@ test('页面恢复既有成本净利的卡片、图表、总额、利润率与�
       assert.equal(card.deltaCaption, 'admin.dashboard.delta.missingYesterday')
       assert.equal(card.deltaText, '')
     }
-    assert.equal(result.periodTotals.value.cost, null)
-    assert.equal(result.periodTotals.value.profit, null)
-    assert.equal(result.runwayDays.value, null)
+    assert.equal(result.periodTotals.value.cost, 30)
+    assert.equal(result.periodSummaries.value.cost.missingDays, 1)
+    assert.equal(result.periodTotals.value.profit, 90)
+    assert.equal(result.runwayDays.value, 60)
     assert.deepEqual(Array.from(result.performanceChartOption.value.xAxis.data), ['9/7', '9/8', '9/9'])
     assert.deepEqual(Array.from(result.performanceChartOption.value.series[1].data), [5, null, 25])
     assert.deepEqual(Array.from(result.performanceChartOption.value.series[2].data), [15, null, 75])
   }
+
+  // 营收为 0（刚过零点）时利润率显示“暂无”，不显示 0% 和虚假的百分点差。
+  metrics.value = buildDashboardMetrics({ ...values(0), todayPurchase: 3, netProfit: -3 }, [
+    { date: '2026-09-08', ...values(40) },
+  ], new Date('2026-09-09T04:00:00Z'))
+  const margin = result.cards.value[3]
+  assert.equal(margin.value, 'admin.dashboard.common.unavailable')
+  assert.equal(margin.deltaText, '')
+  assert.equal(margin.deltaCaption, 'admin.dashboard.delta.missingYesterday')
+
+  // 实时站点余额读取失败时显示未知，覆盖率不可用，而不是按 ¥0 计算。
+  metrics.value = buildDashboardMetrics({ ...values(100), balanceRecorded: false }, [], new Date('2026-09-09T04:00:00Z'))
+  assert.equal(result.siteBalance.value, null)
+  assert.equal(result.coverageRatio.value, null)
 })
 
-// 展示采用记录不是重算账目；收入未完成也不应连带屏蔽成本和存储净利。
-test('整月收入成本标志均false时保留成本净利原值及周月总额，不改输入', () => {
+// 展示采用记录不是重算账目；收入未完成不屏蔽成本，但净利润依赖营收，同为未知。
+test('整月收入成本标志均false时保留成本原值，净利随营收未知，不改输入', () => {
   const points = Array.from({ length: 29 }, (_, day) => Object.freeze({
     date: addDays('2026-09-01', day), ...values(20), revenueComplete: false, purchaseComplete: false,
     todayPurchase: 2, netProfit: -3,
@@ -335,20 +356,20 @@ test('整月收入成本标志均false时保留成本净利原值及周月总额
   const cost = metrics.find(metric => metric.key === 'todayPurchase')!
   const profit = metrics.find(metric => metric.key === 'netProfit')!
   assert.deepEqual(cost.series.month.map(point => point.value), [...Array(29).fill(2), 25])
-  assert.deepEqual(profit.series.month.map(point => point.value), [...Array(29).fill(-3), 75])
+  assert.deepEqual(profit.series.month.map(point => point.value), [...Array(29).fill(null), 75])
   assert.equal(sumDashboardSeries(cost.series.month), 83)
-  assert.equal(sumDashboardSeries(profit.series.month), -12)
+  assert.equal(sumDashboardSeries(profit.series.month), null)
   assert.equal(sumDashboardSeries(cost.series.week), 29)
-  assert.equal(sumDashboardSeries(profit.series.week), 69)
+  assert.deepEqual(summarizeDashboardSeries(profit.series.week), { total: 75, missingDays: 2 })
   assert.deepEqual(cost.comparison, [{ label: '9/29', value: 2 }, { label: '9/30', value: 25 }])
-  assert.deepEqual(profit.comparison, [{ label: '9/29', value: -3 }, { label: '9/30', value: 75 }])
+  assert.deepEqual(profit.comparison, [{ label: '9/30', value: 75 }])
   assert.equal(metrics.find(metric => metric.key === 'todayProfit')!.series.month[0].value, null)
   assert.equal(JSON.stringify(points), original)
 })
 
-test('旧标志缺失时成本零值和存储负净利均保留，各项非有限值独立成为缺口', () => {
+test('旧响应缺成本标志时成本零值和存储负净利均保留，各项非有限值独立成为缺口', () => {
   const now = new Date('2026-09-08T04:00:00Z')
-  const { revenueComplete, purchaseComplete, ...legacy } = values(100)
+  const { purchaseComplete, ...legacy } = values(100)
   const point = { ...legacy, date: '2026-09-07', todayPurchase: 0, netProfit: -7 }
   const metrics = buildDashboardMetrics(values(0), [point as never], now)
   const cost = metrics.find(metric => metric.key === 'todayPurchase')!
@@ -368,4 +389,46 @@ test('旧标志缺失时成本零值和存储负净利均保留，各项非有�
       assert.equal(other.series.week[0].value, key === 'todayPurchase' ? -7 : 0)
     }
   }
+})
+
+// 只由营收补数建行、从未采样过成本的日子：成本未知，不能显示成 ¥0 让净利润等于营收。
+test('成本未记录的日子显示为缺口，不当成 0；周期总额只合计有数据的日子', () => {
+  const metrics = buildDashboardMetrics(values(100), [
+    { date: '2026-09-07', ...values(20) },
+    { date: '2026-09-08', ...values(40), purchaseComplete: false, purchaseRecorded: false, todayPurchase: 0, netProfit: 40 },
+  ], new Date('2026-09-09T04:00:00Z'))
+  const revenue = metrics.find(item => item.key === 'todayProfit')!
+  const cost = metrics.find(item => item.key === 'todayPurchase')!
+  const profit = metrics.find(item => item.key === 'netProfit')!
+  assert.deepEqual(revenue.series.week.map(point => point.value), [20, 40, 100])
+  assert.deepEqual(cost.series.week.map(point => point.value), [5, null, 25])
+  assert.deepEqual(profit.series.week.map(point => point.value), [15, null, 75])
+  assert.equal(cost.comparison.length, 1)
+  assert.equal(profit.comparison.length, 1)
+  assert.deepEqual(summarizeDashboardSeries(cost.series.week), { total: 30, missingDays: 1 })
+  assert.equal(averageKnownValues(cost.recent), 5)
+  // 已采样（purchaseRecorded=true）或已结算的成本照常展示。
+  const sampled = buildDashboardMetrics(values(100), [
+    { date: '2026-09-08', ...values(40), purchaseComplete: false, purchaseRecorded: true },
+  ], new Date('2026-09-09T04:00:00Z')).find(item => item.key === 'todayPurchase')!
+  assert.equal(sampled.comparison.length, 2)
+  assert.deepEqual(summarizeDashboardSeries([]), { total: null, missingDays: 0 })
+  assert.equal(averageKnownValues([{ label: '9/8', value: null }]), null)
+})
+
+test('以服务器北京日期为今天，不受浏览器时钟偏差影响', () => {
+  // 浏览器时钟仍在 9/8，但服务器已是 9/9：实时值必须落在 9/9，昨日为 9/8。
+  const metrics = buildDashboardMetrics({ ...values(100), date: '2026-09-09' }, [
+    { date: '2026-09-08', ...values(40) },
+  ], new Date('2026-09-08T15:59:00Z'))
+  const revenue = metrics.find(item => item.key === 'todayProfit')!
+  assert.deepEqual(revenue.comparison, [{ label: '9/8', value: 40 }, { label: '9/9', value: 100 }])
+})
+
+test('金额负数格式与浮点误差', () => {
+  assert.equal(formatCny(-17), '-¥17.00')
+  assert.equal(formatCny(-0.001), '¥0.00')
+  assert.equal(formatCny(1234.5), '¥1,234.50')
+  assert.deepEqual(computeDelta([0.3, 0.1 + 0.2]), { amount: 0, direction: 'flat' })
+  assert.deepEqual(computeDelta([10, 7.5]), { amount: -2.5, direction: 'down' })
 })

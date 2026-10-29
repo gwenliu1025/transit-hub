@@ -5,7 +5,7 @@ import { test } from 'node:test'
 import { parse, compileScript } from '@vue/compiler-sfc'
 import ts from 'typescript'
 import * as vue from 'vue'
-import { connectionErrorKey, effectiveConnectionProtocol } from '../src/modules/admin/utils/connectionOptions.ts'
+import { connectionErrorKey, effectiveConnectionProtocol, inferredProtocols, protocolFromOwnGroups, recommendedFirst } from '../src/modules/admin/utils/connectionOptions.ts'
 
 const require = createRequire(import.meta.url)
 const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8')
@@ -33,6 +33,8 @@ const pending = () => {
 const fixture = (overrides: Record<string, any> = {}) => {
   const api: Record<string, any> = {
     getMySiteMappingOptions: async () => mappingOptions(),
+    // 默认模拟尚无该接口的旧后端：前端回退到快照类型。
+    getUpstreamGroupProtocol: async () => { throw new Error('admin.mySites.errors.request') },
     listRealConnections: async () => [], listUpstreamKeys: async () => [], listAdminResources: async () => [],
     realConnect: async () => ({}), realBind: async () => ({}), realDisconnect: async () => {}, ...overrides,
   }
@@ -58,23 +60,57 @@ const fixture = (overrides: Record<string, any> = {}) => {
   return { api, state, stop: () => { state.closeConnector(); scope.stop() } }
 }
 
-test('New API 混合协议选择、切换清理及实际创建请求沿用同一 operationId', async () => {
+test('协议推断、分组唯一平台与推荐排序工具函数', () => {
+  assert.deepEqual(inferredProtocols('OpenAI, anthropic, deepseek, google, openai', capabilities), ['openai', 'anthropic', 'gemini'])
+  assert.deepEqual(inferredProtocols(null, capabilities), [])
+  assert.deepEqual(inferredProtocols('openai', null), [])
+  assert.equal(protocolFromOwnGroups([], ownGroups, capabilities), '')
+  assert.equal(protocolFromOwnGroups(['2'], ownGroups, capabilities), 'anthropic')
+  assert.equal(protocolFromOwnGroups(['1', '2'], ownGroups, capabilities), '')
+  assert.equal(protocolFromOwnGroups(['missing'], ownGroups, capabilities), '')
+  assert.equal(protocolFromOwnGroups(['x'], [{ id: 'x', platform: 'sora' }], capabilities), '')
+  assert.deepEqual(recommendedFirst(ownGroups, ['gemini', 'anthropic']).map(g => g.id), ['2', '3', '1', '4'])
+  // Sub2API 上游已知平台不被选择覆盖；New API 上游显式选择优先，否则跟随分组。
+  assert.equal(effectiveConnectionProtocol('sub2api', 'openai', 'anthropic', capabilities, 'gemini'), 'openai')
+  assert.equal(effectiveConnectionProtocol('sub2api', '', '', capabilities, 'gemini'), '')
+  assert.equal(effectiveConnectionProtocol('newapi', 'openai', '', capabilities, 'gemini'), 'gemini')
+  assert.equal(effectiveConnectionProtocol('newapi', 'openai', 'anthropic', capabilities, 'gemini'), 'anthropic')
+})
+
+test('New API 上游先选分组、协议跟随分组，其他平台禁用并沿用同一 operationId', async () => {
   const calls: any[] = []
   const f = fixture({ realConnect: async (payload: any) => { calls.push(payload); throw new Error('secret remote response') } })
   try {
     await f.state.openConnector(rate())
-    assert.equal(f.state.needsGroupTypeSelection.value, true)
+    // 不再强制先选协议：所有可创建账号的分组立即可见，推断厂商对应的平台排在前面并标注推荐。
+    assert.equal(f.state.needsGroupTypeSelection.value, false)
+    assert.equal(f.state.selectedGroupType.value, '')
+    assert.deepEqual(f.state.inferredGroupTypes.value, ['openai', 'anthropic'])
+    assert.deepEqual(f.state.filteredOwnGroups.value.map((g: any) => g.id), ['1', '2', '3', '4'])
+    assert.deepEqual(f.state.filteredOwnGroups.value.map((g: any) => f.state.isRecommendedOwnGroup(g)), [true, true, false, false])
     assert.equal(f.state.canSubmitConnect.value, false)
-    f.state.selectedGroupType.value = 'anthropic'
-    assert.deepEqual(f.state.filteredOwnGroups.value.map((g: any) => g.id), ['2'])
     f.state.toggleOwnGroup('2')
+    assert.equal(f.state.effectiveGroupType.value, 'anthropic')
+    assert.equal(f.state.effectiveGroupTypeName.value, 'Anthropic')
+    assert.equal(f.state.isProtocolOutsideInference.value, false)
     assert.equal(f.state.canSubmitConnect.value, true)
-    f.state.selectedGroupType.value = 'openai'
-    assert.deepEqual(f.state.connectOwnGroups.value, [])
+    // 一个账号只能绑定同平台分组：其他平台禁用且无法加入。
+    const openaiGroup = ownGroups.find(g => g.id === '1')
+    assert.equal(f.state.isOwnGroupLocked(openaiGroup), true)
     f.state.toggleOwnGroup('1')
+    assert.deepEqual(f.state.connectOwnGroups.value, ['2'])
+    f.state.toggleOwnGroup('2')
+    assert.equal(f.state.effectiveGroupType.value, '')
+    assert.equal(f.state.isOwnGroupLocked(openaiGroup), false)
+    assert.equal(f.state.canSubmitConnect.value, false)
+    // 选择推断之外的平台：给出提示但允许提交。
+    f.state.toggleOwnGroup('3')
+    assert.equal(f.state.effectiveGroupType.value, 'gemini')
+    assert.equal(f.state.isProtocolOutsideInference.value, true)
+    assert.equal(f.state.canSubmitConnect.value, true)
     await f.state.submitConnector()
-    assert.equal(calls[0].groupType, 'openai')
-    assert.deepEqual(calls[0].ownGroupIds, ['1'])
+    assert.equal(calls[0].groupType, 'gemini')
+    assert.deepEqual(calls[0].ownGroupIds, ['3'])
     assert.equal(f.state.realConnectError.value, 'admin.groupRates.connect.realFailed')
     await f.state.submitConnector()
     assert.equal(calls[1].operationId, calls[0].operationId)
@@ -83,20 +119,76 @@ test('New API 混合协议选择、切换清理及实际创建请求沿用同一
   } finally { f.stop() }
 })
 
-test('New API 单厂商可覆盖，清空或非法选值不偷偷使用默认协议', async () => {
+test('New API 单厂商只作推荐，不预选协议，也不隐藏其他平台分组', async () => {
   const f = fixture()
   try {
     await f.state.openConnector(rate('anthropic'))
-    assert.equal(f.state.selectedGroupType.value, 'anthropic')
-    assert.equal(f.state.needsGroupTypeSelection.value, true)
-    f.state.selectedGroupType.value = 'openai'
+    assert.equal(f.state.selectedGroupType.value, '')
+    assert.equal(f.state.needsGroupTypeSelection.value, false)
+    assert.equal(f.state.filteredOwnGroups.value[0].id, '2')
+    assert.equal(f.state.filteredOwnGroups.value.length, 4)
+    assert.equal(f.state.effectiveGroupType.value, '')
+    assert.equal(f.state.canSubmitConnect.value, false)
+    f.state.toggleOwnGroup('1')
+    assert.equal(f.state.effectiveGroupType.value, 'openai')
+    assert.equal(f.state.isProtocolOutsideInference.value, true)
+    assert.equal(f.state.canSubmitConnect.value, true)
+    f.state.toggleOwnGroup('1')
+    assert.equal(f.state.effectiveGroupType.value, '')
+    assert.equal(f.state.canSubmitConnect.value, false)
+  } finally { f.stop() }
+})
+
+test('Sub2API 上游以后端缓存的真实平台为准，不受编辑过的快照类型影响', async () => {
+  let payload: any
+  const f = fixture({
+    getUpstreamGroupProtocol: async () => ({ upstreamPlatform: 'sub2api', groupType: 'openai' }),
+    realConnect: async (value: any) => { payload = value; return {} },
+  })
+  try {
+    // 快照类型被手动改为 anthropic，但上游分组真实平台是 openai。
+    await f.state.openConnector(rate('anthropic', 'sub2api'))
+    assert.equal(f.state.effectiveGroupType.value, 'openai')
+    assert.deepEqual(f.state.filteredOwnGroups.value.map((g: any) => g.id), ['1'])
+    f.state.toggleOwnGroup('2')
+    assert.equal(f.state.canSubmitConnect.value, false)
+    f.state.connectOwnGroups.value = []
     f.state.toggleOwnGroup('1')
     assert.equal(f.state.canSubmitConnect.value, true)
-    for (const invalid of ['', 'unknown-protocol']) {
-      f.state.selectedGroupType.value = invalid
-      assert.equal(f.state.effectiveGroupType.value, '')
-      assert.equal(f.state.canSubmitConnect.value, false)
-    }
+    await f.state.submitConnector()
+    assert.equal(payload.groupType, 'openai')
+    assert.deepEqual(payload.ownGroupIds, ['1'])
+  } finally { f.stop() }
+})
+
+test('自有分组空列表按上下文提示，不误导为“请选择”', async () => {
+  const onlyOpenAI = { ...mappingOptions(), ownGroups: ownGroups.filter(g => g.platform === 'openai') }
+  for (const [options, connectRate, expected] of [
+    [mappingOptions(), rate(null, 'sub2api'), 'admin.groupRates.connect.ownGroupNeedProtocol'],
+    [onlyOpenAI, rate('gemini', 'sub2api'), 'admin.groupRates.connect.ownGroupEmptyForProtocol'],
+    [{ ...mappingOptions(), ownGroups: [] }, rate(), 'admin.groupRates.connect.ownGroupEmpty'],
+    [{ ...mappingOptions(), ownGroups: [{ id: '9', platform: 'sora', groupName: 'Sora', multiplier: 1 }] }, rate(), 'admin.groupRates.connect.ownGroupEmpty'],
+  ] as const) {
+    const f = fixture({ getMySiteMappingOptions: async () => options })
+    try {
+      await f.state.openConnector(connectRate)
+      assert.equal(f.state.filteredOwnGroups.value.length, 0)
+      assert.equal(f.state.ownGroupEmptyText.value, expected)
+    } finally { f.stop() }
+  }
+})
+
+test('首次读取能力失败后切换模式，读取完成后重新套用默认值', async () => {
+  const channelOptions = { ...mappingOptions(), connectionCapabilities: { mode: 'channel', requiresGroupType: false, requiresChannelType: true, channelTypes: [{ id: 1, name: 'OpenAI' }, { id: 14, name: 'Anthropic' }], suggestedChannelTypeByGroup: { anthropic: 14 } } }
+  const f = fixture({ getMySiteMappingOptions: async () => { throw new Error('secret') } })
+  try {
+    await f.state.openConnector(rate('anthropic'))
+    assert.equal(f.state.hasLoadedMappingOptions.value, false)
+    assert.equal(f.state.selectedChannelType.value, 0)
+    f.api.getMySiteMappingOptions = async () => channelOptions
+    await f.state.setConnectMode('real')
+    assert.equal(f.state.hasLoadedMappingOptions.value, true)
+    assert.equal(f.state.selectedChannelType.value, 14)
   } finally { f.stop() }
 })
 
@@ -173,7 +265,8 @@ test('映射读取失败不冒充空列表，重载恢复且拒绝旧弹窗响�
     assert.equal(f.state.isLoadingMappingOptions.value, true)
     second.resolve(mappingOptions())
     await current
-    assert.equal(f.state.selectedGroupType.value, 'openai')
+    assert.equal(f.state.selectedGroupType.value, '')
+    assert.deepEqual(f.state.inferredGroupTypes.value, ['openai'])
     assert.equal(f.state.connectingRate.value.siteId, 'current')
   } finally { f.stop() }
 })
@@ -284,10 +377,14 @@ test('真实客户端的 502 不触发本站登出，固定错误可本地化而
 test('所有对接错误投影均有中英本地化且未知键不直接送给翻译器', () => {
   const chinese = evaluate(read('../src/locales/zh-CN.ts')).default
   const english = evaluate(read('../src/locales/en-US.ts')).default
-  const keys = ['localAuth', 'adminAuth', 'adminOnly', 'noCurrentAccount', 'connectionExists', 'groupTypeRequired', 'groupTypeInvalid', 'network', 'invalidUrl', 'remoteAuth', 'remoteRequest', 'invalidResponse', 'notFound']
+  const keys = ['localAuth', 'adminAuth', 'adminOnly', 'noCurrentAccount', 'connectionExists', 'connectionInProgress', 'groupTypeRequired', 'groupTypeInvalid', 'ownGroupPlatformMismatch', 'channelTypeRequired', 'network', 'invalidUrl', 'remoteAuth', 'remoteRequest', 'invalidResponse', 'notFound']
   for (const dictionary of [chinese, english]) {
     for (const key of keys) assert.equal(typeof dictionary.admin.groupRates.connect.errors[key], 'string')
-    for (const key of ['mappingOptionsFailed', 'mappingOptionsLoading', 'capabilitiesUnavailable', 'keysFailed', 'reload']) assert.equal(typeof dictionary.admin.groupRates.connect[key], 'string')
+    for (const key of ['mappingOptionsFailed', 'mappingOptionsLoading', 'capabilitiesUnavailable', 'keysFailed', 'reload', 'ownGroupEmpty', 'ownGroupNeedProtocol', 'ownGroupEmptyForProtocol', 'ownGroupFirstHint', 'recommendedTag', 'protocolFromGroupHint', 'protocolOutsideInference']) assert.equal(typeof dictionary.admin.groupRates.connect[key], 'string')
+    for (const key of ['ownGroupPlatformMismatch', 'channelTypeRequired', 'connectionInProgress']) assert.equal(typeof dictionary.admin.mySites.errors[key], 'string')
+  }
+  for (const key of ['ownGroupPlatformMismatch', 'channelTypeRequired', 'connectionInProgress']) {
+    assert.equal(connectionErrorKey(new Error(`admin.mySites.errors.${key}`), 'fallback'), `admin.groupRates.connect.errors.${key}`)
   }
   assert.equal(connectionErrorKey(new Error('admin.fake.untrusted'), 'fallback'), 'fallback')
   assert.equal(connectionErrorKey({ message: 'admin.upstream.errors.auth' }, 'fallback'), 'fallback')

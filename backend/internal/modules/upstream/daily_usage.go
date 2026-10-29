@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -97,9 +97,22 @@ func (s *PlatformService) fetchDatedUsage(ctx context.Context, session Session, 
 	return *amount, nil
 }
 
-// WithDailyPurchaseForAccount 仅供计划日结：冻结配置、采集并在同一配置锁下提交。
-// 它不证明历史倍率；启动补偿和历史修复必须另有当日配置证据，不能套用此方法。
-func (s *Service) WithDailyPurchaseForAccount(ctx context.Context, userID, adminAccountID, date string, consume func(context.Context, float64) error) error {
+// DailyPurchaseResult 是一次日结成本采集的结果，金额已乘以各站点 rechargeRate。
+// Complete 表示所有计费站点都取得了指定日的精确消费；否则 Amount 只包含
+// 成功站点的精确值，以及失败站点在该日最后一次同步时缓存的当日消费（尽量不丢成本）。
+type DailyPurchaseResult struct {
+	Amount      float64
+	Complete    bool
+	FailedSites int
+	TotalSites  int
+	// Cause 汇总失败站点的原因，供日志与重试判断；Complete 时为 nil。
+	Cause error
+}
+
+// WithDailyPurchaseForAccount 供日结使用：冻结配置、逐站采集并在同一配置锁下提交。
+// 单个站点失败不再拖垮整个工作区：失败站点回退到该日最后一次同步的缓存消费，
+// 结果标记为不完整，由调用方决定是否稍后重试。全部计费站点都没有任何数据时返回错误、不调用 consume。
+func (s *Service) WithDailyPurchaseForAccount(ctx context.Context, userID, adminAccountID, date string, consume func(context.Context, DailyPurchaseResult) error) error {
 	if consume == nil {
 		return errors.New("daily purchase requires consumer")
 	}
@@ -123,6 +136,7 @@ func (s *Service) WithDailyPurchaseForAccount(ctx context.Context, userID, admin
 		return err
 	}
 	amounts := make([]float64, len(sites))
+	recorded := make([]bool, len(sites))
 	errs := make([]error, len(sites))
 	jobs := make(chan int)
 	var workers sync.WaitGroup
@@ -134,26 +148,34 @@ func (s *Service) WithDailyPurchaseForAccount(ctx context.Context, userID, admin
 			for i := range jobs {
 				site := sites[i]
 				if site.RechargeRate == 0 {
+					recorded[i] = true
 					continue
 				}
+				var fetchErr error
 				if site.Session == nil {
-					errs[i] = fmt.Errorf("daily purchase site %s: missing session", site.ID)
-					cancel()
-					continue
+					fetchErr = errors.New("missing session")
+				} else {
+					var amount float64
+					// 日结前先续期会话（并持久化），401 时强制续期重试一次；刷新关闭时令牌也不会过期失效。
+					_, fetchErr = s.withSiteSession(ctx, site.ID, func(session Session) error {
+						var err error
+						amount, err = s.platformService.fetchDatedUsage(ctx, session, date, date, false)
+						return err
+					})
+					if fetchErr == nil {
+						amount *= site.RechargeRate
+						if isFinite(amount) {
+							amounts[i], recorded[i] = amount, true
+							continue
+						}
+						fetchErr = errors.New("invalid amount")
+					}
 				}
-				amount, fetchErr := s.platformService.fetchDatedUsage(ctx, *site.Session, date, date, false)
-				if fetchErr != nil {
-					errs[i] = fmt.Errorf("daily purchase site %s: %w", site.ID, fetchErr)
-					cancel()
-					continue
+				errs[i] = fmt.Errorf("daily purchase site %s: %w", site.ID, fetchErr)
+				// 失败站点若在该日有过成功同步，用最后一次缓存的当日消费兜底，避免整站成本记成 0。
+				if value, ok := cachedConsumeOnDate(site, date); ok {
+					amounts[i], recorded[i] = value, true
 				}
-				amount *= site.RechargeRate
-				if !isFinite(amount) {
-					errs[i] = fmt.Errorf("daily purchase site %s: invalid amount", site.ID)
-					cancel()
-					continue
-				}
-				amounts[i] = amount
 			}
 		}()
 	}
@@ -167,11 +189,30 @@ dispatch:
 	}
 	close(jobs)
 	workers.Wait()
-	if err := errors.Join(errs...); err != nil {
-		return err
-	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	result := DailyPurchaseResult{Complete: true}
+	anyRecorded := len(sites) == 0
+	for i, site := range sites {
+		if site.RechargeRate != 0 {
+			result.TotalSites++
+		}
+		if errs[i] != nil {
+			result.FailedSites++
+			result.Complete = false
+		}
+		if recorded[i] {
+			anyRecorded = true
+		}
+	}
+	result.Cause = errors.Join(errs...)
+	if !anyRecorded || (result.TotalSites > 0 && result.FailedSites == result.TotalSites && !hasPositive(amounts)) {
+		// 没有任何站点给出数据时不落账，保留原有采样。
+		if result.Cause == nil {
+			result.Cause = errors.New("daily purchase has no usable source")
+		}
+		return result.Cause
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -183,18 +224,46 @@ dispatch:
 	if !unchanged {
 		return errors.New("daily purchase configuration changed during collection")
 	}
-	var total float64
 	for _, amount := range amounts {
-		total += amount
+		result.Amount += amount
 	}
-	if !isFinite(total) {
+	if !isFinite(result.Amount) {
 		return errors.New("invalid daily purchase total")
+	}
+	if !result.Complete {
+		log.Printf("[upstream] daily purchase partial user_id=%s admin_account_id=%s date=%s failed_sites=%d total_sites=%d err=%v",
+			userID, adminAccountID, date, result.FailedSites, result.TotalSites, result.Cause)
 	}
 	// 消费者必须用同一有界上下文落账，不得再次进入上游配置接口。
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return consume(ctx, total)
+	return consume(ctx, result)
+}
+
+// cachedConsumeOnDate 返回站点在指定北京日最后一次成功同步时的当日消费（已乘倍率）。
+func cachedConsumeOnDate(site *Site, date string) (float64, bool) {
+	if site == nil || site.LastSyncedAt == nil || site.Metrics.TodayConsume.Value == nil {
+		return 0, false
+	}
+	loc := time.FixedZone("Asia/Shanghai", 8*60*60)
+	if time.UnixMilli(*site.LastSyncedAt).In(loc).Format("2006-01-02") != date {
+		return 0, false
+	}
+	value := *site.Metrics.TodayConsume.Value * site.RechargeRate
+	if !isFinite(value) || value < 0 {
+		return 0, false
+	}
+	return value, true
+}
+
+func hasPositive(values []float64) bool {
+	for _, value := range values {
+		if value > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // purchaseSitesLocked 以持久配置集合核对运行缓存，缺成员不能由 Redis 的跳过行为掩盖。
@@ -273,12 +342,14 @@ func samePurchaseSites(a, b []*Site) bool {
 	return true
 }
 
-// 仅配置与身份变化推进版本；指标刷新不会使正常日结失效。版本阻止 A→B→A 漏检。
+// 仅配置与身份变化推进版本；指标刷新和令牌续期不会使正常日结失效。版本阻止 A→B→A 漏检。
+// 会话令牌不参与比较：同一账号的令牌续期不改变成本口径，若参与比较，
+// 定时同步续期或缓存先于数据库写入都会让整晚日结以“配置变化”失败。
 func samePurchaseConfig(a, b *Site) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	return a.ID == b.ID && a.UserID == b.UserID && a.AdminAccountID == b.AdminAccountID && a.BaseURL == b.BaseURL && a.Platform == b.Platform && a.Account == b.Account && a.RechargeRate == b.RechargeRate && reflect.DeepEqual(a.Session, b.Session)
+	return a.ID == b.ID && a.UserID == b.UserID && a.AdminAccountID == b.AdminAccountID && a.BaseURL == b.BaseURL && a.Platform == b.Platform && a.Account == b.Account && a.RechargeRate == b.RechargeRate && (a.Session == nil) == (b.Session == nil)
 }
 
 func (s *Service) bumpConfigLocked(site *Site) {

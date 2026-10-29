@@ -209,7 +209,7 @@ func (s *PlatformService) refreshSub2APISession(session Session) (Session, error
 
 func (s *PlatformService) FetchMetrics(session Session) (Metrics, error) {
 	if session.Platform == PlatformNewAPI {
-		return s.fetchNewAPIMetrics(session, nil)
+		return s.fetchNewAPIMetricsWithStat(session, nil, true)
 	}
 	return s.fetchSub2APIMetrics(session)
 }
@@ -405,8 +405,8 @@ func (s *PlatformService) FetchSub2APIGroupDailyStats(session Session, groups ..
 	if err := s.VerifySub2APIAdmin(session); err != nil {
 		return nil, err
 	}
-	today := time.Now().Format("2006-01-02")
-	statsURL := session.BaseURL + "/api/v1/admin/dashboard/groups?start_date=" + today + "&end_date=" + today
+	today := sub2APIShanghaiToday()
+	statsURL := session.BaseURL + "/api/v1/admin/dashboard/groups?start_date=" + today + "&end_date=" + today + "&timezone=Asia%2FShanghai"
 	response, err := s.httpClient.requestJSON(statsURL, adminAuthOptions(session))
 	if err != nil {
 		return nil, err
@@ -1211,6 +1211,12 @@ func (s *PlatformService) loginSub2API(baseURL string, email string, password st
 }
 
 func (s *PlatformService) fetchNewAPIMetrics(session Session, loginData map[string]any) (Metrics, error) {
+	return s.fetchNewAPIMetricsWithStat(session, loginData, false)
+}
+
+// fetchNewAPIMetricsWithStat 在 requireStat 时要求今日消费读取成功：定时/手动同步走严格模式，
+// 登录与添加站点仍允许今日统计暂时不可用，避免因统计接口抖动而无法保存站点。
+func (s *PlatformService) fetchNewAPIMetricsWithStat(session Session, loginData map[string]any, requireStat bool) (Metrics, error) {
 	cookieOptions := newAPIAuthOptions(session)
 	self, err := s.httpClient.requestJSON(session.BaseURL+"/api/user/self", cookieOptions)
 	if err != nil {
@@ -1219,7 +1225,12 @@ func (s *PlatformService) fetchNewAPIMetrics(session Session, loginData map[stri
 	statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(todayStart()) + "&end_timestamp=" + strconvInt(todayEnd())
 	stat, err := s.httpClient.requestJSON(statURL, cookieOptions)
 	if err != nil {
+		// 今日消费是成本统计的来源，同步时读取失败必须让本次同步失败并保留上一次的值，
+		// 不能当作“同步成功但今日消费为空”，否则看板会静默把这个站点的成本记成 0。
 		log.Printf("new-api stat request failed base_url=%s err=%v", session.BaseURL, err)
+		if requireStat {
+			return Metrics{}, err
+		}
 		stat = jsonResponse{Payload: map[string]any{}}
 	}
 	groupsPayload, err := s.httpClient.requestJSON(session.BaseURL+"/api/user/self/groups", cookieOptions)
@@ -1344,15 +1355,16 @@ func newAPIUserID(loginData map[string]any) string {
 	return ""
 }
 
+// todayStart/todayEnd 统一按北京时间自然日取 New API 的“今日”窗口。
+// 生产容器默认 UTC，若跟随服务器时区，北京时间 08:00 才换日，凌晨还会把前一天的消费算进今天。
 func todayStart() int64 {
-	now := time.Now()
-	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	start, _, _ := dailyUsageBounds(sub2APIShanghaiToday(), sub2APIShanghaiToday())
 	return start.Unix()
 }
 
 func todayEnd() int64 {
-	now := time.Now()
-	end := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, int(time.Second-time.Nanosecond), now.Location())
+	today := sub2APIShanghaiToday()
+	_, end, _ := dailyUsageBounds(today, today)
 	return end.Unix()
 }
 

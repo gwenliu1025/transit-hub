@@ -85,6 +85,10 @@ export interface DashboardMetricsResponse {
   netProfit: number
   upstreamBalance: number
   groupCount: number
+  /** 服务器的北京业务日期（YYYY-MM-DD）；旧后端没有该字段时由浏览器推算。 */
+  date?: string
+  /** 站点用户余额是否读取成功；false 时 siteBalance 为未知而不是 0。 */
+  balanceRecorded?: boolean
 }
 
 /** 历史趋势单日数据点。 */
@@ -92,6 +96,8 @@ export interface DashboardTrendPoint {
   date: string
   revenueComplete: boolean
   purchaseComplete: boolean
+  /** 成本是否有真实来源（日内采样或部分日结）；false 且未完成时该日成本未知。旧后端没有该字段。 */
+  purchaseRecorded?: boolean
   balanceRecorded: boolean
   todayProfit: number
   siteBalance: number
